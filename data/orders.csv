@@ -1,0 +1,2 @@
+order_id,restaurant_id,order_time,items_gross,restaurant_discount,platform_discount,cofund_discount,packaging,distance,payment_mode,outcome,refund_reason,refund_amount,dispute_status,cancel_seconds,accepted
+ORD001,R001,2026-10-26T12:00:00,250.00,10.00,5.00,20.00,12.00,3.2,UPI,DELIVERED,,,CLOSED,0,1

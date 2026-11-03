@@ -1,0 +1,2 @@
+restaurant_id,name,plan,onboarding_date,rating,packaging_charge,weekly_ad_budget,status
+R001,Sample Kitchen,STANDARD,2025-01-01,4.2,12.00,500.00,ACTIVE

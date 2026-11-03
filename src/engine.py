@@ -1,0 +1,309 @@
+"""Validated file ingestion, persisted order ledgers, disputes and payouts."""
+import csv,json,hashlib
+from datetime import datetime,date,timedelta
+from decimal import Decimal,ROUND_HALF_UP
+from pathlib import Path
+from database.database import connect
+from src.calculations import money,order_breakup
+
+def read_rows(path):
+ p=Path(path)
+ if not p.exists() or not p.is_file(): raise ValueError(f"Input file not found: {p}")
+ if not p.stat().st_size: raise ValueError("Input file is empty")
+ try:
+  if p.suffix.lower()=='.json':
+   x=json.loads(p.read_text(encoding='utf-8-sig')); rows=x.get('rows') if isinstance(x,dict) else x
+   if not isinstance(rows,list): raise ValueError('JSON must be an array or contain a rows array')
+   return rows
+  with p.open(newline='',encoding='utf-8-sig') as f:
+   rows=list(csv.DictReader(f))
+   if not rows: raise ValueError('CSV must include a header and at least one data row')
+   return rows
+ except (json.JSONDecodeError,UnicodeError,csv.Error) as e: raise ValueError(f'Malformed input: {e}') from e
+
+def _normalize_item_csv(rows):
+    item_fields={'item_name','item_quantity','item_unit_price'}
+    if not any(any(row.get(k) not in (None,'') for k in item_fields) for row in rows):
+        return rows
+    groups={}
+    reserved=item_fields
+    for row in rows:
+        order_id=(row.get('order_id') or '').strip()
+        if not order_id: raise ValueError('Every itemized CSV row must have order_id')
+        order=groups.setdefault(order_id,{k:v for k,v in row.items() if k not in reserved and v not in (None,'')})
+        if 'items' not in order: order['items']=[]
+        for key,value in row.items():
+            if key in reserved or value in (None,''): continue
+            if key in order and order[key] not in ('',value):
+                raise ValueError(f'Conflicting order-level value for {key} on {order_id}')
+            order[key]=value
+        if any(row.get(k) not in (None,'') for k in item_fields):
+            if not row.get('item_name') or not row.get('item_unit_price'):
+                raise ValueError('Itemized CSV lines require item_name and item_unit_price')
+            order['items'].append({'name':row['item_name'],'quantity':row.get('item_quantity') or '1','unit_price':row['item_unit_price']})
+    for order in groups.values():
+        if not order['items']: raise ValueError('Each itemized order requires at least one item line')
+        total=sum((Decimal(str(i['quantity']))*money(i['unit_price']) for i in order['items']),Decimal(0))
+        if not order.get('items_gross'): order['items_gross']=str(money(total))
+    return list(groups.values())
+
+def import_restaurants(path):
+ rows=read_rows(path); db=connect()
+ try:
+  for r in rows:
+   plan=r['plan'].upper(); status=r.get('status','ACTIVE').upper(); rating=Decimal(r['rating'])
+   if plan not in ('STANDARD','PLUS') or status not in ('ACTIVE','SUSPENDED') or not 0<=rating<=5: raise ValueError('Invalid plan, status, or rating')
+   date.fromisoformat(r['onboarding_date'][:10]); pack=money(r.get('packaging_charge',0)); budget=money(r.get('weekly_ad_budget',0))
+   status='SUSPENDED' if rating<3 else status
+   db.execute('INSERT INTO restaurants VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(restaurant_id) DO UPDATE SET name=excluded.name,plan=excluded.plan,onboarding_date=excluded.onboarding_date,rating=excluded.rating,packaging_charge=excluded.packaging_charge,weekly_ad_budget=excluded.weekly_ad_budget,status=excluded.status',(r['restaurant_id'],r['name'],plan,r['onboarding_date'],str(rating),str(pack),str(budget),status))
+  db.commit(); return len(rows)
+ finally: db.close()
+
+def import_orders(path):
+ p=Path(path); rows=read_rows(p); rows=_normalize_item_csv(rows) if p.suffix.lower()=='.csv' else rows; digest=hashlib.sha256(p.read_bytes()).hexdigest(); db=connect()
+ try:
+  if db.execute('SELECT 1 FROM processing_history WHERE file_hash=?',(digest,)).fetchone(): return 0
+  latest_ratings={}
+  for r in rows:
+   rest=db.execute('SELECT * FROM restaurants WHERE restaurant_id=?',(r['restaurant_id'],)).fetchone()
+   if not rest: raise ValueError(f"Unknown restaurant: {r['restaurant_id']}")
+   t=datetime.fromisoformat(r['order_time']); outcome=r['outcome'].upper()
+   if rest['status']=='SUSPENDED': raise ValueError(f"Restaurant {r['restaurant_id']} is suspended")
+   if outcome not in ('DELIVERED','CANCELLED_BY_RESTAURANT','CANCELLED_BY_CUSTOMER','REFUND_PARTIAL'): raise ValueError('Invalid outcome')
+   if r.get('dispute_status','CLOSED').upper() not in ('OPEN','CLOSED'): raise ValueError('Invalid dispute status')
+   order_breakup(r | {'outcome':outcome,'order_time':t.isoformat()},dict(rest))
+   item_total=Decimal(0)
+   for item in r.get('items',[]):
+    quantity=Decimal(str(item.get('quantity',1)))
+    if not quantity.is_finite() or quantity<=0: raise ValueError('Item quantity must be positive and finite')
+    item_total+=quantity*money(item['unit_price'])
+   if r.get('items') and money(item_total)!=money(r['items_gross']): raise ValueError('Item quantity and unit prices must sum to items_gross')
+   vals=(r['order_id'],r['restaurant_id'],t.isoformat(),str(money(r['items_gross'])),str(money(r.get('restaurant_discount',0))),str(money(r.get('platform_discount',0))),str(money(r.get('cofund_discount',0))),str(money(r.get('packaging',rest['packaging_charge']))),str(money(r.get('distance',0))),r.get('payment_mode','UNKNOWN'),outcome,r.get('refund_reason','').upper(),str(money(r.get('refund_amount',0))),r.get('dispute_status','CLOSED').upper(),int(r.get('cancel_seconds',0)),int(r.get('accepted',1)),r.get('dispute_closed_at',''),datetime.now().isoformat(timespec='seconds'),str(money(r.get('delivery_fee',0))),str(money(r.get('platform_fee',0))),str(money(r.get('rating',0))) if r.get('rating') else '',str(money(r.get('customer_refund',0))))
+   db.execute('INSERT INTO orders(order_id,restaurant_id,order_time,items_gross,restaurant_discount,platform_discount,cofund_discount,packaging,distance,payment_mode,outcome,refund_reason,refund_amount,dispute_status,cancel_seconds,accepted,dispute_closed_at,processed_at,delivery_fee,platform_fee,rating,customer_refund) VALUES('+','.join('?'*22)+')',vals)
+   if r.get('rating') not in (None,''):
+    rating=Decimal(str(r['rating']))
+    if not rating.is_finite() or rating<0 or rating>5: raise ValueError('Rating must be between zero and five')
+    latest_ratings.setdefault(r['restaurant_id'],[]).append((t.date(),rating))
+   for i,item in enumerate(r.get('items',[]),1): db.execute('INSERT INTO order_items VALUES(?,?,?,?,?)',(r['order_id'],i,item['name'],str(Decimal(str(item.get('quantity',1)))),str(money(item['unit_price']))))
+   if r.get('dispute_status','CLOSED').upper()=='OPEN': db.execute('INSERT OR IGNORE INTO disputes(dispute_id,order_id,opened_at) VALUES(?,?,?)',(r.get('dispute_id',r['order_id']),r['order_id'],r.get('dispute_opened_at',t.isoformat())))
+  for rid,entries in latest_ratings.items():
+   latest_date=max(day for day,_ in entries); week_start=latest_date-timedelta(days=latest_date.weekday()); week_end=week_start+timedelta(days=6)
+   week_ratings=[Decimal(x[0]) for x in db.execute("SELECT rating FROM orders WHERE restaurant_id=? AND rating!='' AND substr(order_time,1,10) BETWEEN ? AND ?",(rid,week_start.isoformat(),week_end.isoformat()))]
+   rating=sum(week_ratings,Decimal(0))/len(week_ratings)
+   old_status=db.execute('SELECT status FROM restaurants WHERE restaurant_id=?',(rid,)).fetchone()[0]
+   db.execute('UPDATE restaurants SET rating=?,status=? WHERE restaurant_id=?',(str(rating),'SUSPENDED' if rating<3 else old_status,rid))
+  db.execute('INSERT INTO processing_history VALUES(?,?,?)',(digest,p.name,datetime.now().isoformat(timespec='seconds'))); db.commit(); return len(rows)
+ except Exception:
+  db.rollback(); raise
+ finally: db.close()
+
+def close_dispute(order_id,closed_at,resolution='RESOLVED'):
+ at=datetime.fromisoformat(closed_at); db=connect()
+ try:
+  r=db.execute('SELECT * FROM orders WHERE order_id=?',(order_id,)).fetchone()
+  if not r: raise ValueError(f'Unknown order: {order_id}')
+  if r['dispute_status']!='OPEN': raise ValueError('Dispute is not open')
+  db.execute("UPDATE orders SET dispute_status='CLOSED',dispute_closed_at=? WHERE order_id=?",(at.isoformat(),order_id))
+  db.execute('UPDATE disputes SET closed_at=?,resolution=? WHERE order_id=? AND closed_at=\'\'',(at.isoformat(),resolution,order_id)); db.commit()
+ finally: db.close()
+
+def import_disputes(path):
+    p=Path(path)
+    if p.suffix.lower()!='.csv': raise ValueError('Dispute event importer accepts CSV files only')
+    rows=read_rows(p); digest=hashlib.sha256(b'disputes:'+p.read_bytes()).hexdigest(); db=connect()
+    try:
+        if db.execute('SELECT 1 FROM processing_history WHERE file_hash=?',(digest,)).fetchone(): return 0
+        count=0
+        for event in rows:
+            dispute_id=event['dispute_id'].strip(); order_id=event['order_id'].strip()
+            action=event['event'].strip().upper(); at=datetime.fromisoformat(event['event_at'])
+            order=db.execute('SELECT * FROM orders WHERE order_id=?',(order_id,)).fetchone()
+            if order is None: raise ValueError(f'Unknown order: {order_id}')
+            if action=='OPEN':
+                existing=db.execute('SELECT * FROM disputes WHERE dispute_id=?',(dispute_id,)).fetchone()
+                if existing: raise ValueError(f'Duplicate dispute ID: {dispute_id}')
+                if order['dispute_status']=='OPEN': raise ValueError(f'Order already has an open dispute: {order_id}')
+                db.execute('INSERT INTO disputes(dispute_id,order_id,opened_at) VALUES(?,?,?)',(dispute_id,order_id,at.isoformat()))
+                db.execute("UPDATE orders SET dispute_status='OPEN',dispute_closed_at='' WHERE order_id=?",(order_id,))
+            elif action=='CLOSE':
+                dispute=db.execute('SELECT * FROM disputes WHERE dispute_id=?',(dispute_id,)).fetchone()
+                if dispute is None or dispute['closed_at']: raise ValueError(f'No open dispute: {dispute_id}')
+                if dispute['order_id']!=order_id: raise ValueError(f'Dispute {dispute_id} belongs to a different order')
+                if at<datetime.fromisoformat(dispute['opened_at']): raise ValueError('Dispute close cannot precede opening')
+                amount=money(event.get('refund_amount',0)); reason=event.get('refund_reason','').strip().upper()
+                if amount>0 and reason not in ('MISSING_ITEM','SPILLED','LATE_DELIVERY'):
+                    raise ValueError('A positive dispute refund requires a supported refund_reason')
+                if amount>0:
+                    if order['outcome'] not in ('DELIVERED','REFUND_PARTIAL'):
+                        raise ValueError('Dispute refunds can adjust delivered or partially refunded orders only')
+                    if order['refund_amount'] not in ('0','0.00') and order['refund_reason']!=reason:
+                        raise ValueError('A single order cannot combine dispute refunds with different funding reasons')
+                    amount=money(Decimal(order['refund_amount'])+amount) if order['refund_reason']==reason else amount
+                    db.execute("UPDATE orders SET outcome='REFUND_PARTIAL',refund_amount=?,refund_reason=? WHERE order_id=?",(str(amount),reason,order_id))
+                db.execute('UPDATE disputes SET closed_at=?,resolution=?,refund_amount=?,refund_reason=? WHERE dispute_id=?',(at.isoformat(),event.get('resolution','RESOLVED'),str(money(event.get('refund_amount',0))),reason,dispute_id))
+                db.execute("UPDATE orders SET dispute_status='CLOSED',dispute_closed_at=? WHERE order_id=?",(at.isoformat(),order_id))
+            else: raise ValueError(f'Unsupported dispute event: {action}')
+            count+=1
+        db.execute('INSERT INTO processing_history VALUES(?,?,?)',(digest,p.name,datetime.now().isoformat(timespec='seconds')))
+        db.commit(); return count
+    except Exception:
+        db.rollback(); raise
+    finally: db.close()
+
+def _penalty_for_order(db,restaurant_id,order_time):
+ d=date.fromisoformat(order_time[:10]); monday=d-timedelta(days=d.weekday()); previous=monday-timedelta(days=7)
+ ratings=[Decimal(x[0]) for x in db.execute("SELECT rating FROM orders WHERE restaurant_id=? AND rating!='' AND substr(order_time,1,10) BETWEEN ? AND ?",(restaurant_id,previous.isoformat(),(monday-timedelta(days=1)).isoformat()))]
+ return bool(ratings) and sum(ratings,Decimal(0))/len(ratings)<Decimal('3.5')
+
+def _tds_for_order(db,r):
+ d=date.fromisoformat(r['order_time'][:10]); fy=date(d.year if d.month>=4 else d.year-1,4,1)
+ rows=db.execute("SELECT order_id,order_time,items_gross,outcome FROM orders WHERE restaurant_id=? AND order_time>=? AND outcome NOT IN ('CANCELLED_BY_RESTAURANT','CANCELLED_BY_CUSTOMER') ORDER BY order_time,order_id",(r['restaurant_id'],fy.isoformat())).fetchall()
+ cumulative=Decimal(0)
+ for x in rows:
+  if x['order_id']==r['order_id']: return money(Decimal(r['items_gross'])*Decimal('.01')) if cumulative>Decimal('500000') and r['outcome'] not in ('CANCELLED_BY_RESTAURANT','CANCELLED_BY_CUSTOMER') else Decimal('0.00')
+  cumulative+=Decimal(x['items_gross'])
+ return Decimal('0.00')
+
+def _breakup_row(r,rest,penalty=False): return order_breakup(dict(r),dict(rest),penalty)
+def get_breakup(order_id):
+ db=connect()
+ try:
+  r=db.execute('SELECT * FROM orders WHERE order_id=?',(order_id,)).fetchone()
+  if not r: raise ValueError(f'Unknown order: {order_id}')
+  effective_time=r['dispute_closed_at'] or r['order_time']
+  result=_breakup_row(r,db.execute('SELECT * FROM restaurants WHERE restaurant_id=?',(r['restaurant_id'],)).fetchone(),_penalty_for_order(db,r['restaurant_id'],effective_time))
+  tds=_tds_for_order(db,r); result['net_restaurant_amount']=(result['net_restaurant_amount']-tds).quantize(Decimal('.01'))
+  return {k:str(v) if isinstance(v,Decimal) else v for k,v in result.items()} | {'tds':str(tds),'order_id':order_id,'restaurant_id':r['restaurant_id'],'items':[dict(x) for x in db.execute('SELECT name,quantity,unit_price FROM order_items WHERE order_id=?',(order_id,))]}
+ finally: db.close()
+
+def _latest_settlement(db,statement):
+    correction=db.execute('SELECT revision,reason,corrected_statement FROM settlement_corrections WHERE settlement_id=? ORDER BY revision DESC LIMIT 1',(statement['settlement_id'],)).fetchone()
+    if correction:
+        statement.update(json.loads(correction['corrected_statement']))
+        statement['correction_revision']=correction['revision']; statement['correction_reason']=correction['reason']
+    else:
+        statement['correction_revision']=0; statement['correction_reason']=''
+    return statement
+
+def correct_settlement(settlement_id,reason):
+    if not reason or not reason.strip(): raise ValueError('Correction reason is required')
+    db=connect()
+    try:
+        base=db.execute('SELECT * FROM settlements WHERE settlement_id=?',(settlement_id,)).fetchone()
+        if base is None: raise ValueError(f'Unknown settlement: {settlement_id}')
+        current=_latest_settlement(db,dict(base)); order_ids=json.loads(base['order_ids'])
+        if not order_ids: raise ValueError('Cannot correct a statement without settled orders')
+        marks=','.join('?' for _ in order_ids)
+        found=db.execute(f'SELECT * FROM orders WHERE order_id IN ({marks})',( *order_ids,)).fetchall()
+        by_id={r['order_id']:r for r in found}; rows=[by_id[x] for x in order_ids if x in by_id]
+        if len(rows)!=len(order_ids): raise ValueError('A source order for this settlement is missing')
+        restaurant=db.execute('SELECT * FROM restaurants WHERE restaurant_id=?',(base['restaurant_id'],)).fetchone()
+        start=date.fromisoformat(base['week_start']); prior=[Decimal(x[0]) for x in db.execute("SELECT rating FROM orders WHERE restaurant_id=? AND rating!='' AND substr(order_time,1,10) BETWEEN ? AND ?",(base['restaurant_id'],(start-timedelta(days=7)).isoformat(),(start-timedelta(days=1)).isoformat()))]
+        rating_penalty=bool(prior) and sum(prior,Decimal(0))/len(prior)<Decimal('3.5')
+        totals={k:Decimal('0.00') for k in ('gross','restaurant_discounts','platform_discounts','packaging','delivery_fees','platform_fees','commission','gst_95','commission_gst','tds','refunds','platform_refunds','penalties','reimbursements')}; calculations=[]
+        for row in rows:
+            b=_breakup_row(row,restaurant,rating_penalty); tds=_tds_for_order(db,row)
+            for key,value in [('gross',b['gross']),('restaurant_discounts',b['restaurant_discount']),('platform_discounts',b['platform_discount']),('packaging',b['packaging']),('delivery_fees',b['delivery_fee']),('platform_fees',b['platform_fee']),('commission',b['commission']),('gst_95',b['gst_95']),('commission_gst',b['commission_gst']),('tds',tds),('refunds',b['restaurant_refund']+b['customer_refund']),('platform_refunds',b['platform_refund']),('penalties',b['penalty']),('reimbursements',b['platform_reimbursement'])]: totals[key]+=value
+            calculations.append((row,b,tds))
+        due=totals['gross']-totals['restaurant_discounts']-totals['platform_discounts']+totals['packaging']-totals['platform_fees']-totals['commission']-totals['gst_95']-totals['commission_gst']-totals['tds']-totals['refunds']-totals['penalties']+totals['reimbursements']
+        original_ads=Decimal(current['ads']); ads=min(original_ads,max(Decimal(0),due)); carry=Decimal(current['carried_debit'])+(original_ads-ads)
+        corrected={key:str(value.quantize(Decimal('.01'),rounding=ROUND_HALF_UP)) for key,value in totals.items()}
+        corrected.update({'ads':str(ads.quantize(Decimal('.01'),rounding=ROUND_HALF_UP)),'payout':str((due-ads).quantize(Decimal('.01'),rounding=ROUND_HALF_UP)),'carried_debit':str(carry.quantize(Decimal('.01'),rounding=ROUND_HALF_UP))})
+        old_json=json.dumps(current,sort_keys=True); new_json=json.dumps(corrected,sort_keys=True)
+        latest=db.execute('SELECT COALESCE(MAX(revision),0) FROM settlement_corrections WHERE settlement_id=?',(settlement_id,)).fetchone()[0]
+        if latest and all(str(current.get(k))==v for k,v in corrected.items()): return current
+        cursor=db.execute('INSERT INTO settlement_corrections(settlement_id,revision,reason,previous_statement,corrected_statement,created_at) VALUES(?,?,?,?,?,?)',(settlement_id,latest+1,reason.strip(),old_json,new_json,datetime.now().isoformat(timespec='seconds')))
+        correction_id=cursor.lastrowid
+        for row,b,tds in calculations:
+            breakup={k:str(v) for k,v in b.items()} | {'tds':str(tds)}
+            db.execute('INSERT INTO settlement_correction_audit(correction_id,order_id,breakup_json,recorded_at) VALUES(?,?,?,?)',(correction_id,row['order_id'],json.dumps(breakup),datetime.now().isoformat(timespec='seconds')))
+        later=db.execute('SELECT 1 FROM settlements WHERE restaurant_id=? AND week_start>? LIMIT 1',(base['restaurant_id'],base['week_start'])).fetchone()
+        if not later:
+            db.execute('INSERT INTO ad_debits(restaurant_id,amount) VALUES(?,?) ON CONFLICT(restaurant_id) DO UPDATE SET amount=excluded.amount',(base['restaurant_id'],corrected['carried_debit']))
+        db.commit(); current.update(corrected); current['correction_revision']=latest+1; current['correction_reason']=reason.strip(); return current
+    except Exception:
+        db.rollback(); raise
+    finally: db.close()
+
+def settle(restaurant_id,week_start,ad_spend=0):
+ start=date.fromisoformat(week_start); end=start+timedelta(days=6)
+ if start.weekday()!=0: raise ValueError('week-start must be a Monday')
+ db=connect()
+ try:
+  rest=db.execute('SELECT * FROM restaurants WHERE restaurant_id=?',(restaurant_id,)).fetchone()
+  if not rest: raise ValueError('Unknown restaurant')
+  exists=db.execute('SELECT * FROM settlements WHERE restaurant_id=? AND week_start=?',(restaurant_id,week_start)).fetchone()
+  if exists: return _latest_settlement(db,dict(exists))
+  rs=db.execute("SELECT * FROM orders WHERE restaurant_id=? AND settlement_id IS NULL AND dispute_status!='OPEN' AND ((dispute_closed_at='' AND substr(order_time,1,10) BETWEEN ? AND ?) OR (dispute_closed_at!='' AND substr(dispute_closed_at,1,10) BETWEEN ? AND ?)) ORDER BY order_time,order_id",(restaurant_id,start.isoformat(),end.isoformat(),start.isoformat(),end.isoformat())).fetchall()
+  # Threshold ledger: all FY orders in chronological order; only GMV above the remaining threshold is withheld.
+  years={}
+  for r in rs:
+   d=date.fromisoformat(r['order_time'][:10]); years.setdefault(d.year if d.month>=4 else d.year-1,None)
+  gmv_before={}
+  for fy_year in years:
+   fy=date(fy_year,4,1); year_orders=db.execute("SELECT order_id,order_time,items_gross FROM orders WHERE restaurant_id=? AND order_time>=? AND order_time<? AND outcome NOT IN ('CANCELLED_BY_RESTAURANT','CANCELLED_BY_CUSTOMER') ORDER BY order_time,order_id",(restaurant_id,fy.isoformat(),date(fy_year+1,4,1).isoformat())).fetchall()
+   cumulative=Decimal(0)
+   for y in year_orders: gmv_before[y['order_id']]=cumulative; cumulative+=Decimal(y['items_gross'])
+  totals={k:Decimal('0.00') for k in ('gross','restaurant_discounts','platform_discounts','packaging','delivery_fees','platform_fees','commission','gst_95','commission_gst','tds','refunds','platform_refunds','penalties','reimbursements')}; ledger=[]
+  prior_ratings=[Decimal(x[0]) for x in db.execute("SELECT rating FROM orders WHERE restaurant_id=? AND rating!='' AND substr(order_time,1,10) BETWEEN ? AND ?",(restaurant_id,(start-timedelta(days=7)).isoformat(),(start-timedelta(days=1)).isoformat()))]
+  penalty=bool(prior_ratings) and sum(prior_ratings,Decimal(0))/len(prior_ratings)<Decimal('3.5')
+  for r in rs:
+   b=_breakup_row(r,rest,penalty); g=Decimal(r['items_gross']); tds=money(g*Decimal('.01')) if r['outcome'] not in ('CANCELLED_BY_RESTAURANT','CANCELLED_BY_CUSTOMER') and gmv_before.get(r['order_id'],Decimal(0))>Decimal('500000') else Decimal('0.00')
+   for k,v in [('gross',b['gross']),('restaurant_discounts',b['restaurant_discount']),('platform_discounts',b['platform_discount']),('packaging',b['packaging']),('delivery_fees',b['delivery_fee']),('platform_fees',b['platform_fee']),('commission',b['commission']),('gst_95',b['gst_95']),('commission_gst',b['commission_gst']),('tds',tds),('refunds',b['restaurant_refund']+b['customer_refund']),('platform_refunds',b['platform_refund']),('penalties',b['penalty']),('reimbursements',b['platform_reimbursement'])]: totals[k]+=v
+   ledger.append((r,b,tds))
+  due=totals['gross']-totals['restaurant_discounts']-totals['platform_discounts']+totals['packaging']-totals['platform_fees']-totals['commission']-totals['gst_95']-totals['commission_gst']-totals['tds']-totals['refunds']-totals['penalties']+totals['reimbursements']
+  debit_row=db.execute('SELECT amount FROM ad_debits WHERE restaurant_id=?',(restaurant_id,)).fetchone()
+  outstanding=Decimal(debit_row[0]) if debit_row else Decimal(0)
+  requested=min(money(ad_spend),money(rest['weekly_ad_budget']))+outstanding; ads=min(requested,max(Decimal(0),due)); carry=requested-ads; payout=due-ads
+  cur=db.execute('INSERT INTO settlements(restaurant_id,week_start,gross,restaurant_discounts,platform_discounts,packaging,delivery_fees,platform_fees,commission,gst_95,commission_gst,tds,refunds,platform_refunds,ads,penalties,reimbursements,payout,carried_debit,order_ids,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(restaurant_id,week_start,*[str(totals[k]) for k in ('gross','restaurant_discounts','platform_discounts','packaging','delivery_fees','platform_fees','commission','gst_95','commission_gst','tds','refunds','platform_refunds')],str(ads),str(totals['penalties']),str(totals['reimbursements']),str(payout.quantize(Decimal('.01'),rounding=ROUND_HALF_UP)),str(money(carry)),json.dumps([r['order_id'] for r in rs]),datetime.now().isoformat(timespec='seconds')))
+  sid=cur.lastrowid
+  for r,b,t in ledger:
+   audit_breakup={k:str(v) for k,v in b.items()} | {'tds':str(t)}
+   db.execute('INSERT INTO settlement_audit(settlement_id,order_id,gross,commission,platform_fee,delivery_fee,tds,refund,breakup_json,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(sid,r['order_id'],str(b['gross']),str(b['commission']),str(b['platform_fee']),str(b['delivery_fee']),str(t),str(b['restaurant_refund']+b['customer_refund']),json.dumps(audit_breakup),datetime.now().isoformat(timespec='seconds')))
+   db.execute('UPDATE orders SET settlement_id=? WHERE order_id=?',(sid,r['order_id']))
+  db.execute('INSERT INTO ad_debits VALUES(?,?) ON CONFLICT(restaurant_id) DO UPDATE SET amount=excluded.amount',(restaurant_id,str(money(carry))))
+  db.commit(); return dict(db.execute('SELECT * FROM settlements WHERE settlement_id=?',(sid,)).fetchone())
+ finally: db.close()
+
+def report(kind,output,fmt=None):
+ db=connect()
+ try:
+  table={'orders':('SELECT * FROM orders ORDER BY order_time,order_id',),'settlements':('SELECT * FROM settlements ORDER BY week_start,restaurant_id',),'audit':('SELECT * FROM settlement_audit ORDER BY audit_id',)}
+  if kind not in table: raise ValueError('Report type must be orders, settlements, or audit')
+  raw=[dict(x) for x in db.execute(table[kind][0])]
+  if kind=='orders':
+   rows=[]
+   for order in raw:
+    rest=db.execute('SELECT * FROM restaurants WHERE restaurant_id=?',(order['restaurant_id'],)).fetchone()
+    effective_time=order['dispute_closed_at'] or order['order_time']
+    breakup=order_breakup(order,dict(rest),_penalty_for_order(db,order['restaurant_id'],effective_time))
+    tds=_tds_for_order(db,order); breakup['net_restaurant_amount']=(breakup['net_restaurant_amount']-tds).quantize(Decimal('.01'))
+    rows.append(order | {f'calc_{k}':str(v) for k,v in breakup.items()} | {'calc_tds':str(tds)})
+  elif kind=='settlements': rows=[_latest_settlement(db,row) for row in raw]
+  elif kind=='audit':
+   rows=[]
+   for row in raw:
+    row['audit_type']='ORIGINAL'; row['correction_id']=''; row['reason']=''; rows.append(row)
+   for c in db.execute('SELECT c.correction_id,c.settlement_id,c.reason,c.created_at,a.order_id,a.breakup_json,a.recorded_at FROM settlement_corrections c JOIN settlement_correction_audit a ON a.correction_id=c.correction_id ORDER BY c.correction_id,a.order_id'):
+    b=json.loads(c['breakup_json'])
+    refund_total=Decimal(b.get('restaurant_refund','0.00'))+Decimal(b.get('customer_refund','0.00'))
+    rows.append({'audit_type':'CORRECTION','correction_id':c['correction_id'],'settlement_id':c['settlement_id'],'order_id':c['order_id'],'reason':c['reason'],'gross':b.get('gross',''),'commission':b.get('commission',''),'platform_fee':b.get('platform_fee',''),'delivery_fee':b.get('delivery_fee',''),'tds':b.get('tds',''),'refund':str(refund_total),'breakup_json':c['breakup_json'],'recorded_at':c['recorded_at']})
+  p=Path(output); p.parent.mkdir(parents=True,exist_ok=True); fmt=(fmt or p.suffix.lstrip('.')).lower()
+  with p.open('w',newline='',encoding='utf-8') as f:
+   if fmt=='json': json.dump(rows,f,indent=2)
+   elif fmt=='csv':
+    if rows:
+     w=csv.DictWriter(f,fieldnames=rows[0].keys()); w.writeheader(); w.writerows(rows)
+   else: raise ValueError('Report format must be csv or json')
+  return len(rows)
+ finally: db.close()
+
+def list_settlements(restaurant_id=None):
+    db=connect()
+    try:
+        if restaurant_id:
+            rows=db.execute('SELECT * FROM settlements WHERE restaurant_id=? ORDER BY week_start',(restaurant_id,)).fetchall()
+        else:
+            rows=db.execute('SELECT * FROM settlements ORDER BY week_start,restaurant_id').fetchall()
+        return [_latest_settlement(db,dict(row)) for row in rows]
+    finally: db.close()
