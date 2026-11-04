@@ -9,25 +9,32 @@ Run from `C:\food delivery`:
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
-py -m pip install -r requirements.txt
-py main.py --help
+python -m pip install -r requirements.txt
+python main.py --help
+```
+
+If `py.exe` is unavailable or blocked, use the existing virtual environment directly:
+
+```powershell
+& '.\.venv\Scripts\python.exe' -m pip install -r requirements.txt
+& '.\.venv\Scripts\python.exe' main.py --help
 ```
 
 The requirements install pytest and ReportLab. The checked-in PDF can be regenerated after editing `docs/design.md`:
 
 ```powershell
-py generate_design_pdf.py
+python generate_design_pdf.py
 ```
 
 ## Initialize and run the sample
 
 ```powershell
-py main.py init-db
-py main.py register-restaurants --file data\restaurants.csv
-py main.py process-orders --file data\orders.csv
-py main.py order-breakup --order-id ORD001
-py main.py weekly-payout --restaurant-id R001 --week-start 2026-10-26 --ad-spend 50
-py main.py list-settlements --restaurant-id R001
+python main.py init-db
+python main.py register-restaurants --file data\restaurants.csv
+python main.py process-orders --file data\orders.csv
+python main.py order-breakup --order-id ORD001
+python main.py weekly-payout --restaurant-id R001 --week-start 2026-10-26 --ad-spend 50
+python main.py list-settlements --restaurant-id R001
 ```
 
 Restaurant CSV columns: `restaurant_id,name,plan,onboarding_date,rating,packaging_charge,weekly_ad_budget`, plus optional `status`.
@@ -47,7 +54,7 @@ DSP001,ORD001,CLOSE,2026-10-27T08:00:00,REFUND_APPROVED,25.00,MISSING_ITEM
 `event` is `OPEN` or `CLOSE`. Closing timestamps must not precede opening timestamps. A positive adjustment requires a supported reason: `MISSING_ITEM`, `SPILLED`, or `LATE_DELIVERY`. The supplied amount is added to an existing partial refund only when its funding reason matches; different refund funders on one order are rejected because the order ledger currently has one partial-refund reason. A free-text resolution with no explicit amount does not create a refund.
 
 ```powershell
-py main.py process-disputes --file data\dispute_events.csv
+python main.py process-disputes --file data\dispute_events.csv
 ```
 
 Open disputed orders are excluded from new settlements. After close, their payout week is the week containing the close timestamp. If the order was already settled, the original statement remains unchanged; use the correction workflow below after the closing event to create a revised statement.
@@ -57,9 +64,9 @@ Open disputed orders are excluded from new settlements. After close, their payou
 Corrections never overwrite the original statement or original per-order audit rows. They append a numbered correction revision and per-order correction audit entries. To correct a settled order after a dispute adjustment:
 
 ```powershell
-py main.py process-disputes --file data\dispute_events.csv
-py main.py correct-settlement --settlement-id 1 --reason "Approved dispute refund"
-py main.py list-settlements --restaurant-id R001
+python main.py process-disputes --file data\dispute_events.csv
+python main.py correct-settlement --settlement-id 1 --reason "Approved dispute refund"
+python main.py list-settlements --restaurant-id R001
 ```
 
 `weekly-payout` and settlement reports show the latest revision while audit exports retain original and correction rows. Corrections preserve the prior ad charge and adjust its carry only when the corrected statement is the restaurant's latest settlement. Later statements are not automatically cascaded or recalculated; correct those statements separately if required.
@@ -69,11 +76,17 @@ py main.py list-settlements --restaurant-id R001
 Reports are calculated from persisted orders/statements and written as CSV or JSON. The output directory is created as needed.
 
 ```powershell
-py main.py report --type orders --output output\orders.json
-py main.py report --type settlements --output output\settlements.csv
-py main.py report --type audit --output output\audit.csv
-py main.py report --type audit --output output\audit.json
-py -m pytest -q
+python main.py report --type orders --output output\orders.json
+python main.py report --type settlements --output output\settlements.csv
+python main.py report --type audit --output output\audit.csv
+python main.py report --type audit --output output\audit.json
+python -m pytest tests -q
+```
+
+For repeatable verification using the working virtual environment and an isolated pytest temporary directory:
+
+```powershell
+& '.\.venv\Scripts\python.exe' -m pytest tests -q --basetemp="$env:TEMP\food-delivery-pytest" -p no:cacheprovider
 ```
 
 Repeat an identical input file to confirm import idempotency. Repeat a payout for the same restaurant/week to receive its existing statement rather than a duplicate settlement.
@@ -88,5 +101,7 @@ Repeat an identical input file to confirm import idempotency. Repeat a payout fo
 - Dispute events support explicit partial refunds by the three documented reasons. They do not infer a refund from resolution text, support multiple funding reasons on a single order, or model a dispute-specific full cancellation.
 - A dispute adjustment after settlement requires the correction command. Later statements that depend on changed carry are not automatically revised.
 - The supplied fixture has one restaurant and one order, not the organizer's 10-restaurant/200-order data or visible expected-output set. Exact hidden-set reconciliation cannot be claimed.
+- BR-11 `SPILLED` refunds split to paise; if the amount contains an odd paisa, that paisa is assigned to the platform. The regression test covers odd and one-paisa amounts.
+- The full suite uses isolated temporary databases. The latest run passed 46 tests; see [BR traceability](docs/br_traceability.md) for test links and partial statuses.
 
 See [the final checklist](docs/final_requirement_checklist.md), [business rules](docs/business_rules.md), [decision log](docs/decision_log.md), and [design PDF](docs/design.pdf) for traceable assumptions and status.
