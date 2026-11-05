@@ -38,8 +38,35 @@ def test_restaurant_cancel_and_refund_funding():
  b=order_breakup(row(outcome='CANCELLED_BY_RESTAURANT',accepted='1'),REST)
  assert b['penalty']==Decimal('100.00') and b['customer_refund']==Decimal('230.00') and b['commission']==0 and b['net_restaurant_amount']==Decimal('-100.00')
  assert order_breakup(row(outcome='CANCELLED_BY_RESTAURANT',accepted='0'),REST)['penalty']==0
- for reason,restaurant,platform in [('MISSING_ITEM','10','0'),('SPILLED','5','0'),('LATE_DELIVERY','0','10')]:
+ for reason,restaurant,platform in [('MISSING_ITEM','10','0'),('SPILLED','5','5'),('LATE_DELIVERY','0','10')]:
   b=order_breakup(row(outcome='REFUND_PARTIAL',refund_reason=reason,refund_amount='10'),REST)
   assert b['restaurant_refund']==Decimal(restaurant) and b['platform_refund']==Decimal(platform)
+
+def test_spilled_refund_odd_paisa_is_assigned_to_platform():
+ b=order_breakup(row(outcome='REFUND_PARTIAL',refund_reason='SPILLED',refund_amount='10.01'),REST)
+ assert b['restaurant_refund']==Decimal('5.00')
+ assert b['platform_refund']==Decimal('5.01')
+ one_paisa=order_breakup(row(outcome='REFUND_PARTIAL',refund_reason='SPILLED',refund_amount='0.01'),REST)
+ assert one_paisa['restaurant_refund']==Decimal('0.00')
+ assert one_paisa['platform_refund']==Decimal('0.01')
+
+def test_commission_rates_for_both_plans_after_introductory_period():
+ d=date(2026,4,1)
+ assert commission_rate('STANDARD',date(2020,1,1),d)==Decimal('.18')
+ assert commission_rate('PLUS',date(2020,1,1),d)==Decimal('.22')
+
+def test_commission_gst_is_eighteen_percent_and_zero_on_flat_fee():
+ regular=order_breakup(row(items_gross='100'),{'plan':'STANDARD','onboarding_date':'2020-01-01','packaging_charge':'0'})
+ small=order_breakup(row(items_gross='99'),{'plan':'STANDARD','onboarding_date':'2020-01-01','packaging_charge':'0'})
+ assert regular['commission_gst']==Decimal('3.24')
+ assert small['commission_gst']==Decimal('0.00')
+
+@pytest.mark.parametrize('changes',[
+ {'restaurant_discount':'201'}, {'refund_reason':'UNKNOWN','outcome':'REFUND_PARTIAL'},
+ {'items_gross':'-1'}, {'items_gross':'NaN'}, {'outcome':'UNKNOWN'},
+])
+def test_order_calculation_rejects_invalid_financial_inputs_and_outcomes(changes):
+ with pytest.raises((ValueError,ArithmeticError)):
+  order_breakup(row(**changes),REST)
 def test_rating_uplift_adds_two_points():
  assert order_breakup(row(),REST,True)['commission_rate']==Decimal('.20')

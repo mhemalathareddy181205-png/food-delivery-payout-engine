@@ -3,7 +3,7 @@ import sqlite3
 from pathlib import Path
 import pytest
 import database.database as database
-from src.engine import import_restaurants,import_orders,import_disputes,close_dispute,correct_settlement,settle,report
+from src.engine import import_restaurants,import_orders,import_disputes,close_dispute,correct_settlement,settle,report,get_breakup
 
 def setup_db(tmp_path,monkeypatch):
  monkeypatch.setattr(database,'DB_PATH',tmp_path/'db.sqlite3')
@@ -132,3 +132,129 @@ def test_dispute_csv_refund_creates_append_only_settlement_correction(tmp_path,m
  assert '127.52' in report_file.read_text(encoding='utf-8')
  audit_file=tmp_path/'audit.json'; report('audit',audit_file,'json')
  assert len(json.loads(audit_file.read_text(encoding='utf-8')))==2
+
+def test_registration_validation_and_duplicate_orders_are_atomic(tmp_path,monkeypatch):
+ setup_db(tmp_path,monkeypatch)
+ bad_rest=tmp_path/'bad-rest.csv'; bad_rest.write_text('restaurant_id,name,plan,onboarding_date,rating\nX,Bad,STANDARD,2026-01-01,NaN\n',encoding='utf-8')
+ with pytest.raises((ValueError,ArithmeticError)): import_restaurants(bad_rest)
+ duplicate=tmp_path/'dupes.json'; duplicate.write_text(json.dumps([order('DUP','2026-04-06T10:00:00'),order('DUP','2026-04-06T11:00:00')]),encoding='utf-8')
+ with pytest.raises(ValueError,match='Duplicate order ID'): import_orders(duplicate)
+ c=sqlite3.connect(database.DB_PATH)
+ assert c.execute('SELECT COUNT(*) FROM orders').fetchone()[0]==0
+ assert c.execute('SELECT COUNT(*) FROM processing_history').fetchone()[0]==0
+ c.close()
+
+@pytest.mark.parametrize('bad_csv,expected',[
+ ('order_id,restaurant_id,order_time\nO,R,2026-04-06T10:00:00\n','require order_id'),
+ ('order_id,restaurant_id,order_time,items_gross\nO,UNKNOWN,2026-04-06T10:00:00,100\n','Unknown restaurant'),
+ ('order_id,restaurant_id,order_time,items_gross,cancel_seconds\nO,R,2026-04-06T10:00:00,100,-1\n','non-negative'),
+ ('order_id,restaurant_id,order_time,items_gross,accepted\nO,R,2026-04-06T10:00:00,100,2\n','accepted must'),
+])
+def test_order_import_rejects_missing_references_and_invalid_flags(tmp_path,monkeypatch,bad_csv,expected):
+ setup_db(tmp_path,monkeypatch); f=tmp_path/'bad.csv'; f.write_text(bad_csv,encoding='utf-8')
+ with pytest.raises(ValueError,match=expected): import_orders(f)
+ c=sqlite3.connect(database.DB_PATH); assert c.execute('SELECT COUNT(*) FROM orders').fetchone()[0]==0; c.close()
+
+def test_invalid_settlement_week_and_same_week_payout_are_safe(tmp_path,monkeypatch):
+ setup_db(tmp_path,monkeypatch); f=tmp_path/'orders.json'; f.write_text(json.dumps([order('O','2026-04-06T10:00:00','500')]),encoding='utf-8'); import_orders(f)
+ with pytest.raises(ValueError,match='Monday'): settle('R','2026-04-07')
+ first=settle('R','2026-04-06','10'); again=settle('R','2026-04-06','200')
+ assert again['settlement_id']==first['settlement_id'] and again['ads']==first['ads']
+ assert len(json.loads(first['order_ids']))==1
+
+def test_ad_budget_caps_requested_spend_and_zero_ad_is_allowed(tmp_path,monkeypatch):
+ setup_db(tmp_path,monkeypatch); c=sqlite3.connect(database.DB_PATH); c.execute("UPDATE restaurants SET weekly_ad_budget='25.00'"); c.commit(); c.close()
+ f=tmp_path/'orders.json'; f.write_text(json.dumps([order('O','2026-04-06T10:00:00','1000')]),encoding='utf-8'); import_orders(f)
+ statement=settle('R','2026-04-06','100')
+ assert statement['ads']=='25.00' and statement['carried_debit']=='0.00'
+
+def test_dispute_events_reject_invalid_transitions_and_roll_back_batch(tmp_path,monkeypatch):
+ setup_db(tmp_path,monkeypatch); f=tmp_path/'orders.json'; f.write_text(json.dumps([order('O','2026-04-06T10:00:00')]),encoding='utf-8'); import_orders(f)
+ events=tmp_path/'bad-events.csv'; events.write_text('dispute_id,order_id,event,event_at\nD1,O,OPEN,2026-04-06T09:00:00\nD1,O,CLOSE,2026-04-06T12:00:00\n',encoding='utf-8')
+ with pytest.raises(ValueError,match='cannot precede order time'): import_disputes(events)
+ c=sqlite3.connect(database.DB_PATH); assert c.execute('SELECT COUNT(*) FROM disputes').fetchone()[0]==0; c.close()
+ good=tmp_path/'open.csv'; good.write_text('dispute_id,order_id,event,event_at\nD1,O,OPEN,2026-04-06T11:00:00\n',encoding='utf-8'); import_disputes(good)
+ duplicate=tmp_path/'duplicate-open.csv'; duplicate.write_text('dispute_id,order_id,event,event_at\nD1,O,OPEN,2026-04-06T12:00:00\n',encoding='utf-8')
+ with pytest.raises(ValueError,match='Duplicate dispute ID'): import_disputes(duplicate)
+
+def test_dispute_refund_requires_supported_reason_and_same_funding_reason(tmp_path,monkeypatch):
+ setup_db(tmp_path,monkeypatch); f=tmp_path/'orders.json'; f.write_text(json.dumps([order('O','2026-04-06T10:00:00')]),encoding='utf-8'); import_orders(f)
+ def event_file(dispute,reason):
+  opened=tmp_path/f'{dispute}-open.csv'; opened.write_text(f'dispute_id,order_id,event,event_at\n{dispute},O,OPEN,2026-04-06T11:00:00\n',encoding='utf-8'); import_disputes(opened)
+  closed=tmp_path/f'{dispute}-close.csv'; closed.write_text(f'dispute_id,order_id,event,event_at,refund_amount,refund_reason\n{dispute},O,CLOSE,2026-04-06T12:00:00,1.00,{reason}\n',encoding='utf-8'); return closed
+ with pytest.raises(ValueError,match='supported refund_reason'): import_disputes(event_file('D1','UNKNOWN'))
+ c=sqlite3.connect(database.DB_PATH); assert c.execute('SELECT dispute_status FROM orders WHERE order_id="O"').fetchone()[0]=='OPEN'; c.close()
+
+def test_dispute_close_without_refund_label_does_not_change_order_refund(tmp_path,monkeypatch):
+ setup_db(tmp_path,monkeypatch); f=tmp_path/'orders.json'; f.write_text(json.dumps([order('O','2026-04-06T10:00:00')]),encoding='utf-8'); import_orders(f)
+ events=tmp_path/'events.csv'; events.write_text('dispute_id,order_id,event,event_at,resolution\nD1,O,OPEN,2026-04-06T11:00:00,\nD1,O,CLOSE,2026-04-07T11:00:00,REFUND_APPROVED\n',encoding='utf-8')
+ assert import_disputes(events)==2
+ c=sqlite3.connect(database.DB_PATH); result=c.execute('SELECT outcome,refund_amount,refund_reason FROM orders WHERE order_id="O"').fetchone(); c.close()
+ assert result==('DELIVERED','0.00','')
+
+def test_dispute_close_before_open_and_unknown_order_are_rejected_atomically(tmp_path,monkeypatch):
+ setup_db(tmp_path,monkeypatch); f=tmp_path/'orders.json'; f.write_text(json.dumps([order('O','2026-04-06T10:00:00')]),encoding='utf-8'); import_orders(f)
+ close_first=tmp_path/'close-first.csv'; close_first.write_text('dispute_id,order_id,event,event_at\nD,O,CLOSE,2026-04-06T12:00:00\nD,O,OPEN,2026-04-06T11:00:00\n',encoding='utf-8')
+ with pytest.raises(ValueError,match='No open dispute'): import_disputes(close_first)
+ unknown=tmp_path/'unknown.csv'; unknown.write_text('dispute_id,order_id,event,event_at\nD,NOPE,OPEN,2026-04-06T11:00:00\n',encoding='utf-8')
+ with pytest.raises(ValueError,match='Unknown order'): import_disputes(unknown)
+ c=sqlite3.connect(database.DB_PATH); assert c.execute('SELECT COUNT(*) FROM disputes').fetchone()[0]==0; c.close()
+
+def test_itemized_csv_total_mismatch_and_empty_file_fail_without_partial_orders(tmp_path,monkeypatch):
+ setup_db(tmp_path,monkeypatch)
+ lines=tmp_path/'mismatch.csv'; lines.write_text('order_id,restaurant_id,order_time,items_gross,item_name,item_quantity,item_unit_price\nI1,R,2026-04-06T10:00:00,25,Bowl,2,10\n',encoding='utf-8')
+ with pytest.raises(ValueError,match='sum to items_gross'): import_orders(lines)
+ empty=tmp_path/'empty.csv'; empty.write_text('',encoding='utf-8')
+ with pytest.raises(ValueError,match='empty'): import_orders(empty)
+ c=sqlite3.connect(database.DB_PATH); assert c.execute('SELECT COUNT(*) FROM orders').fetchone()[0]==0; c.close()
+
+def test_malformed_files_invalid_dates_and_invalid_order_rating_fail_cleanly(tmp_path,monkeypatch):
+ setup_db(tmp_path,monkeypatch)
+ malformed=tmp_path/'bad.json'; malformed.write_text('{not json',encoding='utf-8')
+ with pytest.raises(ValueError,match='Malformed input'): import_orders(malformed)
+ invalid_date=tmp_path/'date.json'; invalid_date.write_text(json.dumps([order('DATE','not-a-date')]),encoding='utf-8')
+ with pytest.raises(ValueError): import_orders(invalid_date)
+ invalid_rating=tmp_path/'rating.json'; invalid_rating.write_text(json.dumps([order('RATING','2026-04-06T10:00:00') | {'rating':'5.1'}]),encoding='utf-8')
+ with pytest.raises(ValueError,match='between zero and five'): import_orders(invalid_rating)
+ c=sqlite3.connect(database.DB_PATH); assert c.execute('SELECT COUNT(*) FROM orders').fetchone()[0]==0; c.close()
+
+def test_orders_already_imported_remain_settleable_after_rating_suspension(tmp_path,monkeypatch):
+ setup_db(tmp_path,monkeypatch); f=tmp_path/'ratings.json'; f.write_text(json.dumps([order('LOW','2026-04-06T10:00:00','100','CLOSED','2.9')]),encoding='utf-8'); import_orders(f)
+ c=sqlite3.connect(database.DB_PATH); assert c.execute('SELECT status FROM restaurants WHERE restaurant_id="R"').fetchone()[0]=='SUSPENDED'; c.close()
+ result=settle('R','2026-04-06')
+ assert json.loads(result['order_ids'])==['LOW']
+
+def test_same_order_cannot_accumulate_disputes_with_different_refund_funders(tmp_path,monkeypatch):
+ setup_db(tmp_path,monkeypatch); f=tmp_path/'orders.json'; f.write_text(json.dumps([order('O','2026-04-06T10:00:00')]),encoding='utf-8'); import_orders(f)
+ def event(dispute, action, reason=''):
+  path=tmp_path/f'{dispute}-{action}.csv'
+  if action=='OPEN': path.write_text(f'dispute_id,order_id,event,event_at\n{dispute},O,OPEN,2026-04-06T11:00:00\n',encoding='utf-8')
+  else: path.write_text(f'dispute_id,order_id,event,event_at,refund_amount,refund_reason\n{dispute},O,CLOSE,2026-04-06T12:00:00,1.00,{reason}\n',encoding='utf-8')
+  return import_disputes(path)
+ event('D1','OPEN'); event('D1','CLOSE','MISSING_ITEM'); event('D2','OPEN')
+ with pytest.raises(ValueError,match='different funding reasons'): event('D2','CLOSE','SPILLED')
+
+def test_correction_repeat_is_idempotent_and_appends_only_when_changed(tmp_path,monkeypatch):
+ setup_db(tmp_path,monkeypatch); f=tmp_path/'orders.json'; f.write_text(json.dumps([order('O','2026-04-06T10:00:00','200')]),encoding='utf-8'); import_orders(f)
+ original=settle('R','2026-04-06'); first=correct_settlement(original['settlement_id'],'Review complete'); second=correct_settlement(original['settlement_id'],'Review complete')
+ assert first['correction_revision']==second['correction_revision']==1
+ c=sqlite3.connect(database.DB_PATH); assert c.execute('SELECT COUNT(*) FROM settlement_corrections').fetchone()[0]==1; c.close()
+
+def test_json_and_csv_reports_include_calculated_orders_and_audit(tmp_path,monkeypatch):
+ setup_db(tmp_path,monkeypatch); f=tmp_path/'orders.json'; f.write_text(json.dumps([order('O','2026-04-06T10:00:00','200')]),encoding='utf-8'); import_orders(f); settle('R','2026-04-06')
+ out=tmp_path/'orders.csv'; assert report('orders',out,'csv')==1
+ with out.open(encoding='utf-8',newline='') as stream: rows=list(csv.DictReader(stream))
+ assert rows[0]['calc_commission']=='36.00' and rows[0]['calc_commission_gst']=='6.48'
+ audit=tmp_path/'audit.csv'; assert report('audit',audit,'csv')==1
+ assert 'ORIGINAL' in audit.read_text(encoding='utf-8')
+
+def test_cli_workflow_uses_only_test_database_and_safe_files(tmp_path,monkeypatch,capsys):
+ import sys,main
+ monkeypatch.setattr(database,'DB_PATH',tmp_path/'cli.sqlite3')
+ root=Path(__file__).resolve().parents[1]; monkeypatch.setattr(database,'ROOT',root)
+ restaurants=tmp_path/'restaurants.csv'; restaurants.write_text('restaurant_id,name,plan,onboarding_date,rating\nR,Test Kitchen,STANDARD,2020-01-01,4.5\n',encoding='utf-8')
+ orders=tmp_path/'orders.csv'; orders.write_text('order_id,restaurant_id,order_time,items_gross\nCLI1,R,2026-04-06T10:00:00,200\n',encoding='utf-8')
+ for args in (['init-db'],['register-restaurants','--file',str(restaurants)],['process-orders','--file',str(orders)],['order-breakup','--order-id','CLI1'],['weekly-payout','--restaurant-id','R','--week-start','2026-04-06'],['report','--type','settlements','--output',str(tmp_path/'report.json')]):
+  monkeypatch.setattr(sys,'argv',['main.py',*args]); main.main()
+  assert capsys.readouterr().out.strip()
+ assert json.loads((tmp_path/'report.json').read_text(encoding='utf-8'))[0]['payout']=='147.52'

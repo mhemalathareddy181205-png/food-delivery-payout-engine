@@ -41,7 +41,10 @@ def order_breakup(row, restaurant, rating_penalty=False):
         if int(row.get("accepted",1)): restaurant_penalty=Decimal("100.00")
     elif status=="REFUND_PARTIAL":
         if reason=="MISSING_ITEM": rr=refund
-        elif reason=="SPILLED": rr=money(refund/2)
+        elif reason=="SPILLED":
+            # BR-11 assigns an odd paisa to the platform half.
+            pr=money(refund/2)
+            rr=refund-pr
         elif reason=="LATE_DELIVERY": pr=refund
         else: raise ValueError(f"Unsupported refund reason: {reason}")
     elif status!="DELIVERED": raise ValueError(f"Unsupported outcome: {status}")

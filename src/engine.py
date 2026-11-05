@@ -16,7 +16,9 @@ def read_rows(path):
    if not isinstance(rows,list): raise ValueError('JSON must be an array or contain a rows array')
    return rows
   with p.open(newline='',encoding='utf-8-sig') as f:
-   rows=list(csv.DictReader(f))
+   reader=csv.DictReader(f)
+   if not reader.fieldnames or any(not name for name in reader.fieldnames): raise ValueError('CSV must include valid column headers')
+   rows=list(reader)
    if not rows: raise ValueError('CSV must include a header and at least one data row')
    return rows
  except (json.JSONDecodeError,UnicodeError,csv.Error) as e: raise ValueError(f'Malformed input: {e}') from e
@@ -51,8 +53,10 @@ def import_restaurants(path):
  rows=read_rows(path); db=connect()
  try:
   for r in rows:
-   plan=r['plan'].upper(); status=r.get('status','ACTIVE').upper(); rating=Decimal(r['rating'])
-   if plan not in ('STANDARD','PLUS') or status not in ('ACTIVE','SUSPENDED') or not 0<=rating<=5: raise ValueError('Invalid plan, status, or rating')
+   required=('restaurant_id','name','plan','onboarding_date','rating')
+   if any(not r.get(key) for key in required): raise ValueError('Restaurant rows require restaurant_id, name, plan, onboarding_date, and rating')
+   plan=r['plan'].strip().upper(); status=r.get('status','ACTIVE').strip().upper(); rating=Decimal(r['rating'])
+   if not rating.is_finite() or plan not in ('STANDARD','PLUS') or status not in ('ACTIVE','SUSPENDED') or not 0<=rating<=5: raise ValueError('Invalid plan, status, or rating')
    date.fromisoformat(r['onboarding_date'][:10]); pack=money(r.get('packaging_charge',0)); budget=money(r.get('weekly_ad_budget',0))
    status='SUSPENDED' if rating<3 else status
    db.execute('INSERT INTO restaurants VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(restaurant_id) DO UPDATE SET name=excluded.name,plan=excluded.plan,onboarding_date=excluded.onboarding_date,rating=excluded.rating,packaging_charge=excluded.packaging_charge,weekly_ad_budget=excluded.weekly_ad_budget,status=excluded.status',(r['restaurant_id'],r['name'],plan,r['onboarding_date'],str(rating),str(pack),str(budget),status))
@@ -64,10 +68,15 @@ def import_orders(path):
  try:
   if db.execute('SELECT 1 FROM processing_history WHERE file_hash=?',(digest,)).fetchone(): return 0
   latest_ratings={}
+  seen_order_ids=set()
   for r in rows:
+   required=('order_id','restaurant_id','order_time','items_gross')
+   if any(not r.get(key) for key in required): raise ValueError('Order rows require order_id, restaurant_id, order_time, and items_gross')
+   if r['order_id'] in seen_order_ids or db.execute('SELECT 1 FROM orders WHERE order_id=?',(r['order_id'],)).fetchone(): raise ValueError(f"Duplicate order ID: {r['order_id']}")
+   seen_order_ids.add(r['order_id'])
    rest=db.execute('SELECT * FROM restaurants WHERE restaurant_id=?',(r['restaurant_id'],)).fetchone()
    if not rest: raise ValueError(f"Unknown restaurant: {r['restaurant_id']}")
-   t=datetime.fromisoformat(r['order_time']); outcome=r['outcome'].upper()
+   t=datetime.fromisoformat(r['order_time']); outcome=r.get('outcome','DELIVERED').upper()
    if rest['status']=='SUSPENDED': raise ValueError(f"Restaurant {r['restaurant_id']} is suspended")
    if outcome not in ('DELIVERED','CANCELLED_BY_RESTAURANT','CANCELLED_BY_CUSTOMER','REFUND_PARTIAL'): raise ValueError('Invalid outcome')
    if r.get('dispute_status','CLOSED').upper() not in ('OPEN','CLOSED'): raise ValueError('Invalid dispute status')
@@ -78,7 +87,9 @@ def import_orders(path):
     if not quantity.is_finite() or quantity<=0: raise ValueError('Item quantity must be positive and finite')
     item_total+=quantity*money(item['unit_price'])
    if r.get('items') and money(item_total)!=money(r['items_gross']): raise ValueError('Item quantity and unit prices must sum to items_gross')
-   vals=(r['order_id'],r['restaurant_id'],t.isoformat(),str(money(r['items_gross'])),str(money(r.get('restaurant_discount',0))),str(money(r.get('platform_discount',0))),str(money(r.get('cofund_discount',0))),str(money(r.get('packaging',rest['packaging_charge']))),str(money(r.get('distance',0))),r.get('payment_mode','UNKNOWN'),outcome,r.get('refund_reason','').upper(),str(money(r.get('refund_amount',0))),r.get('dispute_status','CLOSED').upper(),int(r.get('cancel_seconds',0)),int(r.get('accepted',1)),r.get('dispute_closed_at',''),datetime.now().isoformat(timespec='seconds'),str(money(r.get('delivery_fee',0))),str(money(r.get('platform_fee',0))),str(money(r.get('rating',0))) if r.get('rating') else '',str(money(r.get('customer_refund',0))))
+   cancel_seconds=int(r.get('cancel_seconds',0)); accepted=int(r.get('accepted',1))
+   if cancel_seconds<0 or accepted not in (0,1): raise ValueError('cancel_seconds must be non-negative and accepted must be 0 or 1')
+   vals=(r['order_id'],r['restaurant_id'],t.isoformat(),str(money(r['items_gross'])),str(money(r.get('restaurant_discount',0))),str(money(r.get('platform_discount',0))),str(money(r.get('cofund_discount',0))),str(money(r.get('packaging',rest['packaging_charge']))),str(money(r.get('distance',0))),r.get('payment_mode','UNKNOWN'),outcome,r.get('refund_reason','').upper(),str(money(r.get('refund_amount',0))),r.get('dispute_status','CLOSED').upper(),cancel_seconds,accepted,r.get('dispute_closed_at',''),datetime.now().isoformat(timespec='seconds'),str(money(r.get('delivery_fee',0))),str(money(r.get('platform_fee',0))),str(money(r.get('rating',0))) if r.get('rating') else '',str(money(r.get('customer_refund',0))))
    db.execute('INSERT INTO orders(order_id,restaurant_id,order_time,items_gross,restaurant_discount,platform_discount,cofund_discount,packaging,distance,payment_mode,outcome,refund_reason,refund_amount,dispute_status,cancel_seconds,accepted,dispute_closed_at,processed_at,delivery_fee,platform_fee,rating,customer_refund) VALUES('+','.join('?'*22)+')',vals)
    if r.get('rating') not in (None,''):
     rating=Decimal(str(r['rating']))
@@ -115,6 +126,8 @@ def import_disputes(path):
         if db.execute('SELECT 1 FROM processing_history WHERE file_hash=?',(digest,)).fetchone(): return 0
         count=0
         for event in rows:
+            required=('dispute_id','order_id','event','event_at')
+            if any(not event.get(key) for key in required): raise ValueError('Dispute rows require dispute_id, order_id, event, and event_at')
             dispute_id=event['dispute_id'].strip(); order_id=event['order_id'].strip()
             action=event['event'].strip().upper(); at=datetime.fromisoformat(event['event_at'])
             order=db.execute('SELECT * FROM orders WHERE order_id=?',(order_id,)).fetchone()
@@ -123,6 +136,7 @@ def import_disputes(path):
                 existing=db.execute('SELECT * FROM disputes WHERE dispute_id=?',(dispute_id,)).fetchone()
                 if existing: raise ValueError(f'Duplicate dispute ID: {dispute_id}')
                 if order['dispute_status']=='OPEN': raise ValueError(f'Order already has an open dispute: {order_id}')
+                if at<datetime.fromisoformat(order['order_time']): raise ValueError('Dispute open cannot precede order time')
                 db.execute('INSERT INTO disputes(dispute_id,order_id,opened_at) VALUES(?,?,?)',(dispute_id,order_id,at.isoformat()))
                 db.execute("UPDATE orders SET dispute_status='OPEN',dispute_closed_at='' WHERE order_id=?",(order_id,))
             elif action=='CLOSE':

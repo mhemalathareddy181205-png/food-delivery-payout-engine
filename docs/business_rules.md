@@ -10,7 +10,7 @@
 - BR-08 TDS is 1% of order GMV once cumulative financial-year GMV has already exceeded Rs 5,00,000. The crossing order itself is excluded; future orders are included. FY starts April 1.
 - BR-09 An accepted restaurant cancellation incurs Rs 100 and the customer refund. A not-yet-accepted cancellation incurs no penalty. Customer refund of cancellation is tracked separately.
 - BR-10 Customer cancellation through and including second 60 is free; later cancellation pays the restaurant in full minus commission.
-- BR-11 Partial refund reason MISSING_ITEM is restaurant-funded; SPILLED is split equally (odd paisa to platform); LATE_DELIVERY is platform-funded.
+- BR-11 Partial refund reason MISSING_ITEM is restaurant-funded; SPILLED is split equally in paise with any odd paisa assigned to the platform; LATE_DELIVERY is platform-funded.
 - BR-12 Average order rating in the preceding Monday–Sunday week below 3.5 adds 2 percentage points to commission in the settlement week. Exactly 3.5 adds no penalty. (Rating data is accepted on each order.)
 - BR-13 A recorded weekly average rating below 3 suspends new orders. Existing orders remain eligible for settlement; a later higher rating does not automatically reactivate a suspended restaurant.
 - BR-14 Weekly ads cannot exceed weekly budget or available positive payout. Any unpaid requested spend carries as a debit; unspent budget expires. Carry is attempted against the next payout.
@@ -29,3 +29,7 @@
 ## Statement calculation
 
 Start with item gross; subtract restaurant and platform discounts; add platform-funded reimbursements and packaging; subtract platform fees, commission, both GST deductions, TDS, restaurant-funded refunds, customer cancellation refunds, and penalties. Delivery fee is reported separately and excluded from restaurant payout. Ads are then deducted up to positive payout and the restaurant's weekly budget; unpaid requested ad spend carries forward. A negative pre-ad balance remains visible where other deductions exceed proceeds.
+
+## Verification status
+
+`docs/br_traceability.md` maps each BR-ID to implementation and automated tests. The BR-11 SPILLED split is verified for even, odd, and one-paisa refunds. Some BRs remain partial because the brief does not settle fee allocation, certain tax/cancellation cases, threshold crossing treatment, or downstream correction carry recalculation. Those are listed in the final checklist; they must not be treated as confirmed policy.

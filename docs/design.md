@@ -13,6 +13,7 @@
 5. Weekly settlement selects unassigned eligible orders, calculates one statement, records a complete per-order audit snapshot, then locks those orders to its unique statement.
 6. A post-settlement dispute change uses `correct-settlement`. The original statement and audit are retained; a new revision and correction audit are appended. Reports display the latest statement revision and both audit histories.
 7. Reports export calculated order breakups, current settlement revisions, and audit history as CSV or JSON.
+8. Imports validate required fields and numeric flags before commit. Duplicate order IDs within a batch fail the transaction. Failed dispute batches also roll back as a unit. A repeated correction with no changed monetary result does not append a duplicate revision.
 
 ## Money and reporting
 
@@ -24,4 +25,4 @@ Restaurant columns: `restaurant_id,name,plan,onboarding_date,rating,packaging_ch
 
 ## Known scope choices
 
-Rates and GST bases follow the supplied brief, with unresolved cancellation tax treatment documented separately. Platform fee below Rs 100 uses the specified flat minimum; other platform fees are accepted as already-calculated amounts. Delivery fees are recorded but not allocated without a defined recipient. Rating averages from the prior week set the following week's commission rate. See `decision_log.md` for exact interpretations and correction limits.
+Rates and GST bases follow the supplied brief, with unresolved cancellation tax treatment documented separately. Platform fee below Rs 100 uses the specified flat minimum; other platform fees are accepted as already-calculated amounts. Delivery fees are recorded but not allocated without a defined recipient. Rating averages from the prior week set the following week's commission rate. For `SPILLED` refunds, the platform receives half rounded half-up to paise and the restaurant receives the remainder. See `decision_log.md` for exact interpretations and correction limits, and `br_traceability.md` for rule-to-test links.
