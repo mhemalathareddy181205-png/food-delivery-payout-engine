@@ -16,10 +16,11 @@ def read_rows(path):
    if not isinstance(rows,list): raise ValueError('JSON must be an array or contain a rows array')
    return rows
   with p.open(newline='',encoding='utf-8-sig') as f:
-   reader=csv.DictReader(f)
+   reader=csv.DictReader(f,strict=True)
    if not reader.fieldnames or any(not name for name in reader.fieldnames): raise ValueError('CSV must include valid column headers')
    rows=list(reader)
    if not rows: raise ValueError('CSV must include a header and at least one data row')
+   if any(None in row for row in rows): raise ValueError('CSV rows cannot contain more fields than the header')
    return rows
  except (json.JSONDecodeError,UnicodeError,csv.Error) as e: raise ValueError(f'Malformed input: {e}') from e
 

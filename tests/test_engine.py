@@ -144,6 +144,16 @@ def test_registration_validation_and_duplicate_orders_are_atomic(tmp_path,monkey
  assert c.execute('SELECT COUNT(*) FROM processing_history').fetchone()[0]==0
  c.close()
 
+def test_registration_persists_profile_and_suspends_low_profile_rating(tmp_path,monkeypatch):
+ setup_db(tmp_path,monkeypatch)
+ profile=tmp_path/'profile.csv'
+ profile.write_text('restaurant_id,name,plan,onboarding_date,rating,packaging_charge,weekly_ad_budget\nLOW,Low Kitchen,PLUS,2025-01-01,2.9,12.50,300\n',encoding='utf-8')
+ assert import_restaurants(profile)==1
+ c=sqlite3.connect(database.DB_PATH)
+ row=c.execute('SELECT name,plan,onboarding_date,rating,packaging_charge,weekly_ad_budget,status FROM restaurants WHERE restaurant_id=?',('LOW',)).fetchone()
+ c.close()
+ assert row==('Low Kitchen','PLUS','2025-01-01','2.9','12.50','300.00','SUSPENDED')
+
 @pytest.mark.parametrize('bad_csv,expected',[
  ('order_id,restaurant_id,order_time\nO,R,2026-04-06T10:00:00\n','require order_id'),
  ('order_id,restaurant_id,order_time,items_gross\nO,UNKNOWN,2026-04-06T10:00:00,100\n','Unknown restaurant'),
@@ -212,6 +222,10 @@ def test_malformed_files_invalid_dates_and_invalid_order_rating_fail_cleanly(tmp
  setup_db(tmp_path,monkeypatch)
  malformed=tmp_path/'bad.json'; malformed.write_text('{not json',encoding='utf-8')
  with pytest.raises(ValueError,match='Malformed input'): import_orders(malformed)
+ malformed_csv=tmp_path/'bad.csv'; malformed_csv.write_text('order_id,restaurant_id,order_time,items_gross\n"O,R,2026-04-06T10:00:00,100\n',encoding='utf-8')
+ with pytest.raises(ValueError,match='Malformed input'): import_orders(malformed_csv)
+ extra_column=tmp_path/'extra.csv'; extra_column.write_text('order_id,restaurant_id,order_time,items_gross\nO,R,2026-04-06T10:00:00,100,unexpected\n',encoding='utf-8')
+ with pytest.raises(ValueError,match='more fields than the header'): import_orders(extra_column)
  invalid_date=tmp_path/'date.json'; invalid_date.write_text(json.dumps([order('DATE','not-a-date')]),encoding='utf-8')
  with pytest.raises(ValueError): import_orders(invalid_date)
  invalid_rating=tmp_path/'rating.json'; invalid_rating.write_text(json.dumps([order('RATING','2026-04-06T10:00:00') | {'rating':'5.1'}]),encoding='utf-8')
@@ -253,8 +267,17 @@ def test_cli_workflow_uses_only_test_database_and_safe_files(tmp_path,monkeypatc
  monkeypatch.setattr(database,'DB_PATH',tmp_path/'cli.sqlite3')
  root=Path(__file__).resolve().parents[1]; monkeypatch.setattr(database,'ROOT',root)
  restaurants=tmp_path/'restaurants.csv'; restaurants.write_text('restaurant_id,name,plan,onboarding_date,rating\nR,Test Kitchen,STANDARD,2020-01-01,4.5\n',encoding='utf-8')
- orders=tmp_path/'orders.csv'; orders.write_text('order_id,restaurant_id,order_time,items_gross\nCLI1,R,2026-04-06T10:00:00,200\n',encoding='utf-8')
- for args in (['init-db'],['register-restaurants','--file',str(restaurants)],['process-orders','--file',str(orders)],['order-breakup','--order-id','CLI1'],['weekly-payout','--restaurant-id','R','--week-start','2026-04-06'],['report','--type','settlements','--output',str(tmp_path/'report.json')]):
+ orders=tmp_path/'orders.csv'; orders.write_text('order_id,restaurant_id,order_time,items_gross\nCLI1,R,2026-04-06T10:00:00,200\nCLI2,R,2026-04-06T11:00:00,100\n',encoding='utf-8')
+ events=tmp_path/'disputes.csv'; events.write_text('dispute_id,order_id,event,event_at,refund_amount,refund_reason\nDSP1,CLI1,OPEN,2026-04-07T09:00:00,,\nDSP1,CLI1,CLOSE,2026-04-08T09:00:00,10.00,MISSING_ITEM\nDSP2,CLI2,OPEN,2026-04-07T10:00:00,,\n',encoding='utf-8')
+ for args in (['init-db'],['register-restaurants','--file',str(restaurants)],['process-orders','--file',str(orders)],['order-breakup','--order-id','CLI1'],['weekly-payout','--restaurant-id','R','--week-start','2026-04-06'],['process-disputes','--file',str(events)],['correct-settlement','--settlement-id','1','--reason','Approved dispute refund'],['close-dispute','--order-id','CLI2','--closed-at','2026-04-09T09:00:00'],['list-settlements','--restaurant-id','R'],['report','--type','orders','--output',str(tmp_path/'orders.csv'),'--format','csv'],['report','--type','settlements','--output',str(tmp_path/'report.json')],['report','--type','audit','--output',str(tmp_path/'audit.json')]):
   monkeypatch.setattr(sys,'argv',['main.py',*args]); main.main()
   assert capsys.readouterr().out.strip()
- assert json.loads((tmp_path/'report.json').read_text(encoding='utf-8'))[0]['payout']=='147.52'
+ assert json.loads((tmp_path/'report.json').read_text(encoding='utf-8'))[0]['payout']=='211.28'
+ audit=json.loads((tmp_path/'audit.json').read_text(encoding='utf-8'))
+ assert [row['audit_type'] for row in audit]==['ORIGINAL','ORIGINAL','CORRECTION','CORRECTION']
+ c=sqlite3.connect(database.DB_PATH)
+ assert c.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
+ assert c.execute('PRAGMA foreign_key_check').fetchall()==[]
+ assert c.execute('SELECT COUNT(*) FROM settlement_corrections').fetchone()[0]==1
+ assert c.execute('SELECT COUNT(*) FROM settlement_correction_audit').fetchone()[0]==2
+ c.close()

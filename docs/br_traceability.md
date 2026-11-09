@@ -4,7 +4,7 @@ Status describes the documented behavior currently implemented and exercised by 
 
 | BR-ID | Requirement | Implementation File/Function | Test File/Test Name | Status |
 |---|---|---|---|---|
-| BR-01 | Restaurant registration and stored profile; weekly-average suspension rule is specified in BR-13 | `src/engine.py`: `import_restaurants`, `import_orders` | `tests/test_engine.py`: `test_low_rating_suspends_future_orders`, `test_single_low_rating_does_not_suspend_when_weekly_average_is_three`, `test_orders_already_imported_remain_settleable_after_rating_suspension` | Verified; rating aggregation is covered by interpretation tests |
+| BR-01 | Restaurant registration and stored profile; registration profile rating behavior is distinct from the weekly-average suspension rule in BR-13 | `src/engine.py`: `import_restaurants` | `tests/test_engine.py`: `test_registration_persists_profile_and_suspends_low_profile_rating`, `test_registration_validation_and_duplicate_orders_are_atomic` | Verified; order-rating weekly average is covered separately in BR-13 |
 | BR-02 | STANDARD 18%, PLUS 22% | `src/calculations.py`: `commission_rate` | `tests/test_calculations.py`: `test_commission_rates_for_both_plans_after_introductory_period` | Verified |
 | BR-03 | 12% introductory rate through day 60 inclusive | `src/calculations.py`: `commission_rate` | `tests/test_calculations.py`: `test_onboarding_day_60_inclusive` | Verified |
 | BR-04 | Restaurant/platform/co-funded discount bases and funding | `src/calculations.py`: `order_breakup` | `tests/test_calculations.py`: `test_discount_funding_and_cofund`, `test_odd_paisa_cofund_and_packaging_cap_together`, `test_order_calculation_rejects_invalid_financial_inputs_and_outcomes` | Verified |

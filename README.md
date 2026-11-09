@@ -1,6 +1,25 @@
 # PS-039 Food Delivery Commission and Restaurant Payout Engine
 
-Python 3.10+, SQLite, CSV/JSON command files. The application registers restaurants, imports orders and dispute events, prints calculated breakups, settles Monday–Sunday weeks, retains correction history, and exports calculated reports. Monetary values use `Decimal` with `ROUND_HALF_UP` to paise.
+## Overview and objectives
+
+This project calculates restaurant payouts from restaurant profiles, order inputs, discounts, packaging, commissions, tax deductions, refunds, advertising spend and dispute events. It stores source records and settlement history in SQLite, provides a command-line workflow, and exports order, settlement and audit reports. The objective is a repeatable, reviewable ledger: validated inputs produce paise-rounded financial calculations, while disputes and corrections retain historical evidence.
+
+The project uses Python 3.10+, SQLite, CSV/JSON and `Decimal` with `ROUND_HALF_UP`. It uses pytest for verification and ReportLab for the design PDF. No web framework or network service is required.
+
+## Project structure
+
+```text
+main.py                    CLI entry point
+config.py                  project paths and shared settings
+src/calculations.py        Decimal financial calculations
+src/engine.py              imports, validation, settlement, disputes and reports
+database/database.py       SQLite connection and additive migrations
+database/schema.sql        tables, keys and constraints
+data/                      demonstration CSV inputs
+tests/                     calculation, engine and CLI integration tests
+docs/                      rules, design, traceability and submission materials
+generate_design_pdf.py     design Markdown to PDF generator
+```
 
 ## Setup (Windows PowerShell)
 
@@ -28,6 +47,8 @@ python generate_design_pdf.py
 
 ## Initialize and run the sample
 
+These commands write the configured local database and `output` directory. Use a disposable project copy for a presentation or destructive workflow; automated tests use temporary databases and do not touch the checked-in SQLite file.
+
 ```powershell
 python main.py init-db
 python main.py register-restaurants --file data\restaurants.csv
@@ -37,13 +58,34 @@ python main.py weekly-payout --restaurant-id R001 --week-start 2026-10-26 --ad-s
 python main.py list-settlements --restaurant-id R001
 ```
 
+`init-db` creates the schema if needed and applies additive compatibility migrations. Registration and imports are repeatable by content hash; a new file containing an already-seen order ID is rejected atomically. Do not use the sample database for destructive testing.
+
+## CLI command reference
+
+```powershell
+python main.py init-db
+python main.py register-restaurants --file data\restaurants.csv
+python main.py process-orders --file data\orders.csv
+python main.py order-breakup --order-id ORD001
+python main.py process-disputes --file data\dispute_events.csv
+python main.py close-dispute --order-id ORD001 --closed-at 2026-10-27T08:00:00
+python main.py weekly-payout --restaurant-id R001 --week-start 2026-10-26 --ad-spend 50
+python main.py correct-settlement --settlement-id 1 --reason "Approved dispute adjustment"
+python main.py list-settlements --restaurant-id R001
+python main.py report --type orders --output output\orders.json
+python main.py report --type settlements --output output\settlements.csv
+python main.py report --type audit --output output\audit.csv
+```
+
+Each command accepts `--help`. Settlement week-start must be a Monday. The CLI reports argument and domain validation errors through argparse with a non-zero exit status.
+
 Restaurant CSV columns: `restaurant_id,name,plan,onboarding_date,rating,packaging_charge,weekly_ad_budget`, plus optional `status`.
 
 Aggregate order CSV remains supported with one row per order and `items_gross`. For named item lines, provide one CSV row per item using `item_name,item_quantity,item_unit_price`; repeat order-level fields on each line, and provide the same `order_id`. `items_gross` may be omitted and is then calculated from the item lines. If supplied, it must match their total. JSON remains supported, with `items:[{"name":"Meal","quantity":2,"unit_price":"10.00"}]`. Named line items persist in `order_items` and appear in `order-breakup`.
 
 ## Dispute event CSV
 
-Run `process-disputes` with a CSV containing one event per row:
+The dispute CSV contains one event per row. Import the referenced order first; the checked-in sample order file does not include `ORD-DISPUTE-002`, so the dispute CSV is a format example and is not a standalone command sequence.
 
 ```text
 dispute_id,order_id,event,event_at,resolution,refund_amount,refund_reason
@@ -73,7 +115,7 @@ python main.py list-settlements --restaurant-id R001
 
 ## Reports and tests
 
-Reports are calculated from persisted orders/statements and written as CSV or JSON. The output directory is created as needed.
+Reports are calculated from persisted orders/statements and written as CSV or JSON. The output directory is created as needed. Order reports contain stored inputs and calculated breakup fields. Settlement reports show the latest correction revision. Audit reports include original settlement snapshots and appended correction snapshots. CSV is selected by `.csv` output extension and JSON by `.json`, or can be specified with `--format`.
 
 ```powershell
 python main.py report --type orders --output output\orders.json
@@ -83,7 +125,7 @@ python main.py report --type audit --output output\audit.json
 python -m pytest tests -q
 ```
 
-For repeatable verification using the working virtual environment and an isolated pytest temporary directory:
+For repeatable verification using the working virtual environment and an isolated pytest temporary directory (use a fresh path if Windows has a stale temp directory):
 
 ```powershell
 & '.\.venv\Scripts\python.exe' -m pytest tests -q --basetemp="$env:TEMP\food-delivery-pytest" -p no:cacheprovider
@@ -102,6 +144,10 @@ Repeat an identical input file to confirm import idempotency. Repeat a payout fo
 - A dispute adjustment after settlement requires the correction command. Later statements that depend on changed carry are not automatically revised.
 - The supplied fixture has one restaurant and one order, not the organizer's 10-restaurant/200-order data or visible expected-output set. Exact hidden-set reconciliation cannot be claimed.
 - BR-11 `SPILLED` refunds split to paise; if the amount contains an odd paisa, that paisa is assigned to the platform. The regression test covers odd and one-paisa amounts.
-- The full suite uses isolated temporary databases. The latest run passed 46 tests; see [BR traceability](docs/br_traceability.md) for test links and partial statuses.
+- The full suite uses isolated temporary databases. The latest run passed 47 tests; see [BR traceability](docs/br_traceability.md) for test links and partial statuses.
+
+## Requirement and submission documents
+
+The [business rule register](docs/business_rules.md), [BR traceability matrix](docs/br_traceability.md), [decision log](docs/decision_log.md), [database design](docs/database_design.md), [test plan](docs/test_plan.md), and [final checklist](docs/final_requirement_checklist.md) document implemented behavior and open policies. The [five-minute demo plan](docs/demo_script.md) and [viva guide](docs/viva_preparation.md) support the presentation. Regenerate the PDF with `python generate_design_pdf.py` after editing `docs/design.md`.
 
 See [the final checklist](docs/final_requirement_checklist.md), [business rules](docs/business_rules.md), [decision log](docs/decision_log.md), and [design PDF](docs/design.pdf) for traceable assumptions and status.

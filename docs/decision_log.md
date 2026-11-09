@@ -1,5 +1,24 @@
 # Decision log
 
+The decisions below are implementation interpretations where the supplied brief leaves room for choice. Alternatives are recorded to make the choice reviewable; “confirmation required” means the behavior must not be presented as organizer-approved policy.
+
+| Decision area | Decision and reason | Alternative considered | Impact | Confirmation |
+|---|---|---|---|---|
+| Introductory commission | Include onboarding day 60 because the requirement says through day 60. | End the rate before day 60. | Defines the exact rate boundary. | No; stated by requirement. |
+| Financial year/TDS | Reset April 1; exclude canceled GMV; withhold only after prior cumulative GMV exceeds Rs 5 lakh. A sequential ledger makes the convention deterministic. | Withhold on the transaction that crosses the threshold. | Changes TDS at the threshold boundary. | Yes; crossing transaction convention. |
+| Discount base and funders | Restaurant discount reduces the base; platform share is reimbursed; co-funding splits with odd paisa to platform. | Deduct all coupons from restaurant earnings or round the platform share down. | Affects commission and restaurant net. | Confirm only if organizer specification differs. |
+| Tax and cancellation | Apply stated rates to documented bases; where cancellations/refunds have no specified adjustment, retain the current calculation as an explicit assumption. | Invent a prorated tax reversal or cancellation-specific rate. | Changes GST and cancellation payouts. | Yes; refund/cancellation tax base. |
+| Cancellation refund | Model the full cancellation refund from discounted customer item amount plus packaging; apply the stated restaurant penalty only when accepted. | Refund gross items without discount/packaging adjustments. | Changes customer refund and restaurant debit. | Yes; refund base and interactions. |
+| Weekly selection | Use Monday through Sunday and choose close-date week for a closed dispute. | Keep the order-date week after a dispute closes. | Determines which statement includes the order. | No for week mapping; Tuesday-only execution still needs confirmation. |
+| Ads | Cap requested ads by budget and positive available payout; carry unpaid requested spend. | Allow ads to create a negative payout or expire unpaid authorized spend. | Determines payout and future debit. | No; matches documented rule. |
+| Platform fee | Use the stated Rs 10 sub-Rs 100 minimum; accept other supplied fees as precomputed deductions. | Infer a formula or tax from distance/order value. | Avoids inventing an unsupported fee formula. | Yes; general fee formula/tax and cancellation treatment. |
+| Delivery fee | Report the supplied amount, exclude from payout until collector/recipient is specified. | Deduct it from restaurant or add it to payout. | Preserves visibility without choosing a beneficiary. | Yes; formula, collector and allocation. |
+| Dispute refund schema | Allow one funding reason per order and reject conflicting funders rather than silently allocating them. | Add multiple refund-funder ledgers. | Limits supported cumulative dispute refunds. | Yes; confirm multiple funders requirement. |
+| Corrections | Append revisions and per-order audit; update carry only when correcting the latest statement. | Rewrite history or cascade all later statements automatically. | Preserves original evidence but leaves later statements unchanged. | Yes; downstream statement/carry cascade. |
+| Duplicate processing | Hash complete file bytes and reject repeated IDs in different files. | Treat each file replay as a new import or silently skip duplicate IDs. | Gives idempotent replay with atomic duplicate protection. | No; supports ledger integrity. |
+
+Technical choices—SQLite for a local single-user ledger, Decimal for money, parameterized SQL, temporary databases in tests, and additive schema migrations—preserve correctness and compatibility without adding dependencies or deleting records.
+
 1. Day 60 after onboarding is included in the 12% introductory rate.
 2. FY starts April 1. The order that takes cumulative eligible GMV over Rs 5 lakh is excluded; later eligible orders incur 1% TDS. Eligible GMV excludes canceled orders, includes delivered and partially refunded orders, and is sequenced by order timestamp then ID. Open disputes count toward the GMV threshold, but their own TDS is recorded when settled.
 3. Section 9(5) GST is 5% of gross item value for non-canceled orders; canceled orders have zero realized item value and zero GST. Commission GST is 18% of commission. The brief does not explicitly state canceled-order GST treatment.

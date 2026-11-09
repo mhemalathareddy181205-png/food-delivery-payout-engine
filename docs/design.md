@@ -4,6 +4,37 @@
 
 `main.py` provides the command line. `src/calculations.py` contains side-effect-free Decimal formulas. `src/engine.py` validates CSV/JSON, writes source records, closes disputes, builds weekly statements, and exports reports. `database/database.py` opens SQLite and applies `database/schema.sql` on each connection. The existing database file is `database/settlements.sqlite3`.
 
+```mermaid
+classDiagram
+    class CLI {
+      +parse_args()
+      +dispatch_command()
+    }
+    class Engine {
+      +import_restaurants()
+      +import_orders()
+      +import_disputes()
+      +settle()
+      +correct_settlement()
+      +report()
+    }
+    class Calculations {
+      +money()
+      +commission_rate()
+      +order_breakup()
+    }
+    class Database {
+      +connect()
+      +apply_schema_and_additive_migrations()
+    }
+    CLI --> Engine
+    Engine --> Calculations
+    Engine --> Database
+    Database --> SQLite
+```
+
+The CLI translates arguments into engine calls and serializes successful results as JSON. The engine owns validation, transaction boundaries, persistence and orchestration. Calculation functions receive order and restaurant data and return a breakup without opening a database connection. SQLite enforces keys and relationships while exact arithmetic remains in Python.
+
 ## Processing flow
 
 1. Register restaurant profiles.
@@ -14,6 +45,48 @@
 6. A post-settlement dispute change uses `correct-settlement`. The original statement and audit are retained; a new revision and correction audit are appended. Reports display the latest statement revision and both audit histories.
 7. Reports export calculated order breakups, current settlement revisions, and audit history as CSV or JSON.
 8. Imports validate required fields and numeric flags before commit. Duplicate order IDs within a batch fail the transaction. Failed dispute batches also roll back as a unit. A repeated correction with no changed monetary result does not append a duplicate revision.
+
+```mermaid
+flowchart LR
+    Files[CSV or JSON inputs] --> CLI[main.py CLI]
+    CLI --> Engine[src/engine.py validation and workflow]
+    Engine --> Calc[src/calculations.py Decimal breakup]
+    Engine <--> DB[(SQLite database)]
+    DB --> Engine
+    Engine --> Reports[CSV or JSON reports]
+```
+
+## Order, settlement and dispute states
+
+```mermaid
+stateDiagram-v2
+    [*] --> Imported
+    Imported --> Disputed: OPEN event
+    Disputed --> Imported: CLOSE without refund
+    Disputed --> RefundAdjusted: CLOSE with supported refund
+    Imported --> Settled: eligible weekly settlement
+    RefundAdjusted --> Settled: eligible weekly settlement
+    Settled --> Corrected: correction request after source change
+    Corrected --> Corrected: later numbered correction
+```
+
+Open disputes are excluded from settlement. On closure, the close timestamp determines the assigned payout week. A settled order remains attached to its original statement; a later dispute adjustment creates a correction revision rather than rewriting that statement.
+
+## Database interactions and transaction boundaries
+
+`connect()` enables foreign keys, executes the idempotent schema, and applies additive column migrations when needed. Restaurant and order imports commit complete files, dispute event files commit as a unit, settlement creation stores the statement/audit/order links together, and correction creation stores the revision and its per-order audit rows together. Unique keys protect order IDs, restaurant/week statements, dispute IDs, correction revisions and per-settlement audit orders. Source records, statement history and original audit snapshots are retained.
+
+## Settlement workflow
+
+1. Validate that the requested week starts on Monday and load the restaurant.
+2. Select unassigned orders whose order date is in the requested week, or whose dispute close date is in that week; omit open disputes.
+3. Determine the prior-week rating adjustment and calculate each order breakup.
+4. Calculate TDS in financial-year order, aggregate statement totals, cap ads by budget and positive available payout, and retain unpaid ad debit.
+5. In one database transaction, insert the unique statement and per-order audit, assign the orders, update ad debit, then commit.
+
+## Dispute and correction workflows
+
+An OPEN event creates a dispute record and marks the order open. A matching CLOSE event must not predate OPEN. Only an explicit positive amount with a supported funding reason adjusts the order refund ledger. If its refund funder conflicts with a prior refund reason, the event is rejected. After settlement, `correct-settlement` recomputes the statement from its source orders and appends a numbered revision with per-order audit snapshots. Later settlements are not automatically cascaded; this remains a pending policy/implementation limitation.
 
 ## Money and reporting
 
