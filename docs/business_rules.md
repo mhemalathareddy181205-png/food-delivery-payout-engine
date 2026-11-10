@@ -1,43 +1,31 @@
-# Business rules
+# Business Rules Register (PS-039)
 
-- BR-01 Registration stores plan, onboarding date, profile rating, packaging, weekly ad budget and status. A profile rating under 3 at registration initializes the restaurant as suspended. This registration-time profile value is distinct from individual order ratings; weekly-average suspension is governed by BR-13.
-- BR-02 Standard commission is 18%; Plus is 22%.
-- BR-03 Onboarding days 0 through 60 inclusive use 12% (an order exactly 60 days after onboarding qualifies).
-- BR-04 Restaurant discounts reduce the commission base. Platform coupons are reimbursed and do not reduce it. A co-funded discount is split 50:50; an odd paisa is assigned to the platform half.
-- BR-05 Packaging is separately payable, capped at Rs 30. The configured/order charge above the cap is recorded as disallowed and not charged.
-- BR-06 Platform GST under Section 9(5) is 5% of gross item value and is deducted from restaurant proceeds for remittance.
-- BR-07 Commission GST is 18% of commission and is a separate restaurant deduction.
-- BR-08 TDS is 1% of order GMV once cumulative financial-year GMV has already exceeded Rs 5,00,000. The crossing order itself is excluded; future orders are included. FY starts April 1.
-- BR-09 An accepted restaurant cancellation incurs Rs 100 and the customer refund. A not-yet-accepted cancellation incurs no penalty. Customer refund of cancellation is tracked separately.
-- BR-10 Customer cancellation through and including second 60 is free; later cancellation pays the restaurant in full minus commission.
-- BR-11 Partial refund reason MISSING_ITEM is restaurant-funded; SPILLED is split equally in paise with any odd paisa assigned to the platform; LATE_DELIVERY is platform-funded.
-- BR-12 Average order rating in the preceding Monday–Sunday week below 3.5 adds 2 percentage points to commission in the settlement week. Exactly 3.5 adds no penalty. (Rating data is accepted on each order.)
-- BR-13 The applicable recorded weekly average order rating below 3 suspends future order imports; a single low order rating does not trigger suspension when the weekly average is 3 or higher. Existing orders remain eligible for settlement; a later higher rating does not automatically reactivate a suspended restaurant.
-- BR-14 Weekly ads cannot exceed weekly budget or available positive payout. Any unpaid requested spend carries as a debit; unspent budget expires. Carry is attempted against the next payout.
-- BR-15 Payout week is Monday–Sunday, payable Tuesday. Supply the Monday as week start.
-- BR-16 Open disputes are excluded. After closure the order belongs to the Monday–Sunday week containing the dispute close date, including a Sunday 23:59 open/Tues 08:00 close example.
-- BR-17 Net item value below Rs 100 has a flat Rs 10 platform fee instead of percentage commission; commission GST is zero on that fee. Exactly Rs 100 uses percentage commission. Platform fee is deducted from payout.
-- BR-18 Every money input/result uses Decimal, rounded half-up to Rs 0.01.
-- BR-19 Order IDs are unique. Byte-identical import files are skipped. Settled order IDs are locked, statements are unique per restaurant/week, and an audit row is unique per settled order.
-- BR-20 Inputs require valid dates, finite nonnegative monetary values, valid references, supported outcomes and refund reasons.
-- BR-21 Platform-funded discounts are deducted from gross proceeds and added back as reimbursements, so they do not reduce restaurant earnings or commission base.
-- BR-22 Supplied delivery fees appear in breakups, weekly statement totals, and audit rows, but are informational and excluded from restaurant payout because the brief does not identify a collector, recipient, or calculation rule.
-- BR-23 For orders at or above Rs 100, a supplied platform fee is assumed to be an already-calculated restaurant deduction. The brief supplies no formula for other platform fees.
-- BR-24 CSV dispute events are explicit OPEN/CLOSE events with timestamps. Only a CLOSE event with a supported refund reason and amount changes the order refund ledger.
-- BR-25 Post-settlement corrections append a numbered statement revision and correction audit rows; original statements and audit snapshots are retained.
-
-## Statement calculation
-
-Start with item gross; subtract restaurant and platform discounts; add platform-funded reimbursements and packaging; subtract platform fees, commission, both GST deductions, TDS, restaurant-funded refunds, customer cancellation refunds, and penalties. Delivery fee is reported separately and excluded from restaurant payout. Ads are then deducted up to positive payout and the restaurant's weekly budget; unpaid requested ad spend carries forward. A negative pre-ad balance remains visible where other deductions exceed proceeds.
-
-## Verification status
-
-`docs/br_traceability.md` maps each BR-ID to implementation and automated tests. The BR-11 SPILLED split is verified for even, odd, and one-paisa refunds. Some BRs remain partial because the brief does not settle fee allocation, certain tax/cancellation cases, threshold crossing treatment, or downstream correction carry recalculation. Those are listed in the final checklist; they must not be treated as confirmed policy.
-
-## Policy status
-
-**Confirmed by the supplied rule register:** plan rates, introductory period, discount funders, packaging cap, stated tax rates, refund reason funders, rating thresholds, weekly ad cap behavior, Monday-to-Sunday week, dispute exclusion, fee boundary, Decimal rounding, uniqueness and audit requirements.
-
-**Implemented interpretations requiring confirmation where the brief is silent:** initial profile rating under 3 sets registration status to suspended; the crossing TDS order is excluded; canceled orders have zero 9(5) GST and no minimum fee; cancellation refund is modeled from discounted customer item amount plus packaging; the platform fee outside the minimum is treated as a supplied deduction; delivery fee is informational; and correction revisions do not cascade to later statements. These conventions are recorded in `decision_log.md` and are not represented as confirmed organizer policy.
-
-**Pending organizer clarification:** TDS treatment on the threshold-crossing transaction; canceled/refunded-order tax bases; cancellation refund and discount interactions; minimum/general platform-fee taxes and cancellation treatment; delivery-fee formula, collector and payout allocation; whether settlement must execute only on Tuesday; whether one order can combine refund funding reasons; and downstream statement/ad-debit recalculation after historical correction. See `final_requirement_checklist.md` for the impact and evidence.
+- **BR-01 Commission Plans & Introductory Rate**:
+  Standard commission is 18% of net item value; Plan PLUS is 22% (includes free listing boost). The first 60 days from onboarding (days 0 through 60 inclusive) qualify for an introductory 12% commission rate. Commission is strictly never charged on packaging.
+- **BR-02 Discount Funding & Commission Base**:
+  Restaurant-funded discounts reduce the commission base (`net_item_value = gross_item_value - restaurant_discount`). Platform coupons do not reduce the commission base; the platform reimburses the restaurant for the coupon amount (`coupon_reimbursement = platform_coupon`). Co-funded offers (50:50) split the discount: the restaurant's 50% reduces the commission base, while the platform's 50% is reimbursed. If an odd paisa exists, it is assigned to the platform half.
+- **BR-03 Packaging Charge & Cap**:
+  A restaurant may charge up to Rs 30 per order for packaging. Any packaging charge above Rs 30 is capped and the excess is disallowed (`packaging_allowed = min(packaging_charge, 30.00)`, `packaging_disallowed = max(0.00, packaging_charge - 30.00)`). Commission is never charged on packaging.
+- **BR-04 Section 9(5) GST & Commission GST**:
+  Under Section 9(5) of the CGST Act, the platform is liable to pay 5% GST on the restaurant item value directly to the government; this 5% is deducted from the restaurant's payout as a statutory deduction (`gst_9_5 = round(gross_item_value * 0.05)`). Separately, 18% GST is charged to the restaurant on the platform commission (`gst_on_commission = round(commission * 0.18)`).
+- **BR-05 Section 194-O TDS Threshold**:
+  Under Section 194-O of the Income Tax Act, the platform deducts 1% TDS on the gross item value for restaurants whose cumulative financial-year GMV on the platform exceeds Rs 5 lakh (`tds_194o = round(gross_item_value * 0.01)`). FY GMV resets on April 1 and equals `opening_fy_gmv` plus delivered order gross GMV. When an order pushes cumulative GMV past Rs 5 lakh, 1% TDS applies from that crossing transaction onward.
+- **BR-06 Cancellation Rules**:
+  - `CANCELLED_BY_RESTAURANT`: If cancelled after acceptance, costs the restaurant a flat Rs 100 penalty (`penalty = 100.00`) and the full customer refund is borne by the restaurant (`refund_restaurant_share = customer_refund`). If cancelled before acceptance, penalty is zero.
+  - `CANCELLED_BY_CUSTOMER`: If cancelled within 60 seconds of order placement (`cancel_seconds <= 60`), cancellation is free to the customer (`CANCELLED_BY_CUSTOMER_FREE`); customer gets 100% refund, no commission is charged, and restaurant net is 0.00. If cancelled after 60 seconds (`CANCELLED_BY_CUSTOMER_CHARGED`), customer pays 100% and restaurant is paid in full minus commission, packaging allowed, coupon reimbursement, and statutory taxes.
+- **BR-07 Partial Refund Funding Reasons**:
+  Partial refunds are allocated strictly according to fault/category:
+  - `MISSING_ITEM`: 100% borne by restaurant (`refund_restaurant_share += refund_amount`).
+  - `SPILLED`: Split 50% restaurant and 50% platform. Any odd paisa is assigned to the platform share.
+  - `LATE_DELIVERY`: 100% borne by platform (`refund_platform_share += refund_amount`).
+  - Unsupported refund reasons (e.g. `COLD_FOOD`) are rejected and excluded from the refund ledger.
+- **BR-08 Rating Penalties & Order Suspension**:
+  Average order rating in the preceding Monday–Sunday week dictates penalties for the following week:
+  - Average rating strictly below 3.50 adds 2.0 percentage points to commission for the following week (`next_week_commission_uplift_pp = 2.0`). An average of exactly 3.50 incurs no penalty (`0.0`).
+  - Average rating strictly below 3.00 suspends the restaurant from accepting new orders (`suspended_next_week = true`). Any new order placed while suspended is immediately `REJECTED`. Unrated orders are excluded from the weekly average.
+- **BR-09 Advertising Spend & Debit Carry-Forward**:
+  Actual ad spend is deducted from weekly payout up to the restaurant's weekly budget and available positive proceeds (`gross_payable`). Unspent budget does not carry over. Ad spend deductions never push the payout below zero; any remaining unpaid ad spend rolls forward as a debit (`debit_carried_forward`).
+- **BR-10 Weekly Payout Cycle & Dispute Settlement**:
+  Settlement runs weekly on Tuesday for orders delivered Monday through Sunday. Orders with an open dispute are excluded from the delivery week's statement (`orders_excluded_dispute = 1`) and are settled in the weekly statement corresponding to when the dispute closes.
+- **BR-11 Minimum Order Platform Fee**:
+  Orders with net item value below Rs 100 attract a flat Rs 10 platform fee charged to the restaurant instead of percentage commission (`platform_fee = 10.00`, `commission = 0.00`, `gst_on_commission = 0.00`). Orders with net item value of exactly Rs 100 or above use normal percentage commission (`platform_fee = 0.00`).

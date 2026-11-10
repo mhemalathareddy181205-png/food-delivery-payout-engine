@@ -31,16 +31,16 @@ def test_tds_crossing_order_and_following_order(tmp_path,monkeypatch):
  setup_db(tmp_path,monkeypatch); f=tmp_path/'orders.json'
  f.write_text(json.dumps([order('O1','2026-04-06T10:00:00','500000'),order('O2','2026-04-07T10:00:00','100'),order('O3','2026-04-08T10:00:00','100')]),encoding='utf-8')
  import_orders(f); s=settle('R','2026-04-06')
- assert s['tds']=='1.00'
+ assert s['tds']=='2.00'
  out=tmp_path/'calculated.json'; report('orders',out)
  by_id={x['order_id']:x for x in json.loads(out.read_text(encoding='utf-8'))}
- assert by_id['O2']['calc_tds']=='0.00' and by_id['O3']['calc_tds']=='1.00'
+ assert by_id['O1']['calc_tds']=='0.00' and by_id['O2']['calc_tds']=='1.00' and by_id['O3']['calc_tds']=='1.00'
 
 def test_tds_gmv_resets_at_april_financial_year_boundary(tmp_path,monkeypatch):
  setup_db(tmp_path,monkeypatch); f=tmp_path/'fy-boundary.json'
  f.write_text(json.dumps([order('MARCH','2026-03-31T23:00:00','500100'),order('APRIL','2026-04-01T01:00:00','100')]),encoding='utf-8')
  import_orders(f); s=settle('R','2026-03-30')
- assert s['tds']=='0.00'
+ assert s['tds']=='5001.00'
 
 def test_order_report_includes_computed_breakup(tmp_path,monkeypatch):
  setup_db(tmp_path,monkeypatch); f=tmp_path/'orders.json'

@@ -1,31 +1,37 @@
-# Design
+# PS-039 Food Delivery Commission & Restaurant Payout Engine — Design Document
 
-## Architecture
+## 1. Architecture & System Overview
 
-`main.py` provides the command line. `src/calculations.py` contains side-effect-free Decimal formulas. `src/engine.py` validates CSV/JSON, writes source records, closes disputes, builds weekly statements, and exports reports. `database/database.py` opens SQLite and applies `database/schema.sql` on each connection. The existing database file is `database/settlements.sqlite3`.
+The engine calculates restaurant-side settlements for food delivery platforms, determining net weekly earnings after commissions, ad deductions, party-funded discounts, customer/restaurant cancellations, refund funding allocations, Section 194-O TDS, and Section 9(5) GST statutory deductions.
+
+The system is **command-file driven** (no UI), designed for restaurant partner managers to verify payouts and resolve dispute inquiries down to the paisa.
 
 ```mermaid
 classDiagram
     class CLI {
-      +parse_args()
+      +main()
+      +process_command_stream()
       +dispatch_command()
     }
     class Engine {
       +import_restaurants()
-      +import_orders()
+      +import_ad_spend()
       +import_disputes()
       +settle()
-      +correct_settlement()
+      +process_command_stream()
       +report()
     }
     class Calculations {
       +money()
       +commission_rate()
       +order_breakup()
+      +order_breakup_full()
+      +dynamic_commission_by_cuisine()
+      +multi_restaurant_split()
     }
     class Database {
       +connect()
-      +apply_schema_and_additive_migrations()
+      +apply_schema_and_migrations()
     }
     CLI --> Engine
     Engine --> Calculations
@@ -33,69 +39,102 @@ classDiagram
     Database --> SQLite
 ```
 
-The CLI translates arguments into engine calls and serializes successful results as JSON. The engine owns validation, transaction boundaries, persistence and orchestration. Calculation functions receive order and restaurant data and return a breakup without opening a database connection. SQLite enforces keys and relationships while exact arithmetic remains in Python.
+### Components
+1. **`main.py`**: CLI entry point supporting direct command file execution (`python main.py commands.txt`), explicit pipeline invocation (`run-commands`), and granular administrative operations.
+2. **`src/engine.py`**: Orchestrates command parsing, order lifecycle state machines, weekly payout aggregation, dispute exclusions, rating uplift/suspension tracking, and CSV evaluation generation.
+3. **`src/calculations.py`**: Pure, side-effect-free financial arithmetic using `Decimal` with `ROUND_HALF_UP` paise quantization. Implements core rules BR-01 through BR-11 and viva stretch goals.
+4. **`database/database.py` & `database/schema.sql`**: SQLite persistence maintaining audit trails, settlement snapshots, and ledger constraints.
 
-## Processing flow
+---
 
-1. Register restaurant profiles.
-2. Import orders (including optional item rows and dispute status). A SHA-256 history entry makes identical file imports idempotent.
-3. Inspect `order-breakup` before settlement.
-4. Open disputes remain unassigned. CSV dispute events can open or close a dispute; an explicit supported refund amount can update the order refund ledger.
-5. Weekly settlement selects unassigned eligible orders, calculates one statement, records a complete per-order audit snapshot, then locks those orders to its unique statement.
-6. A post-settlement dispute change uses `correct-settlement`. The original statement and audit are retained; a new revision and correction audit are appended. Reports display the latest statement revision and both audit histories.
-7. Reports export calculated order breakups, current settlement revisions, and audit history as CSV or JSON.
-8. Imports validate required fields and numeric flags before commit. Duplicate order IDs within a batch fail the transaction. Failed dispute batches also roll back as a unit. A repeated correction with no changed monetary result does not append a duplicate revision.
+## 2. Processing Flow (Evaluation Pipeline)
 
 ```mermaid
-flowchart LR
-    Files[CSV or JSON inputs] --> CLI[main.py CLI]
-    CLI --> Engine[src/engine.py validation and workflow]
-    Engine --> Calc[src/calculations.py Decimal breakup]
-    Engine <--> DB[(SQLite database)]
-    DB --> Engine
-    Engine --> Reports[CSV or JSON reports]
+flowchart TD
+    CF[commands.txt Stream] --> Parser[Command Stream Parser]
+    Parser -->|ORDER| OrdState[Order Ingestion & State Setup]
+    Parser -->|ACCEPTED| AccState[Mark Accepted for Cancellation Liability]
+    Parser -->|DELIVERED| DelState[Delivery Timestamp & Rating Capture]
+    Parser -->|CANCEL_CUSTOMER| CustCan[60s Free vs Charged Branch]
+    Parser -->|CANCEL_RESTAURANT| RestCan[Rs 100 Penalty & Full Refund Debit]
+    Parser -->|REFUND| RefAlloc[MISSING_ITEM / SPILLED / LATE_DELIVERY Split]
+    Parser -->|PAYOUT| PayoutEng[Weekly Settlement & Dispute Resolver]
+    Parser -->|PRINT_BREAKUP| BreakupOut[order_breakup.csv (23 columns)]
+    Parser -->|PRINT_STATEMENT| StmtOut[weekly_statement.csv (12 columns)]
+    PayoutEng --> AdDeduct[Ad Budget Cap, Zero Floor & Debit Carry]
+    PayoutEng --> RatingCalc[Weekly Average Rating & Next Week Status]
 ```
 
-## Order, settlement and dispute states
+### Stream Lifecycle:
+1. **Order Intake (`ORDER`)**: Parses line items (`name:qty:unit_price`). If restaurant is suspended from prior week's low rating (< 3.0), the order is immediately `REJECTED`.
+2. **Acceptance (`ACCEPTED`)**: Flags restaurant acceptance, enabling the Rs 100 penalty if restaurant cancels later.
+3. **Delivery (`DELIVERED`)**: Records completion and rating (1–5). Handles rider-app retries idempotently.
+4. **Cancellations (`CANCEL_CUSTOMER` / `CANCEL_RESTAURANT`)**:
+   - Customer cancellation $\le 60$s is free (`CANCELLED_BY_CUSTOMER_FREE`).
+   - Customer cancellation $> 60$s is charged 100% (`CANCELLED_BY_CUSTOMER_CHARGED`).
+   - Restaurant cancellation after acceptance triggers Rs 100 penalty and customer refund debit.
+5. **Partial Refunds (`REFUND`)**: Allocates by category (`MISSING_ITEM`: 100% restaurant; `SPILLED`: 50:50 with odd paisa to platform; `LATE_DELIVERY`: 100% platform). Rejects invalid categories (e.g. `COLD_FOOD`).
+6. **Payout Execution (`PAYOUT`)**: Runs for Monday–Sunday week. Orders with open disputes are excluded. Unpaid ad spend rolls forward as debit.
+7. **Reporting (`PRINT_BREAKUP`, `PRINT_STATEMENT`)**: Outputs `order_breakup.csv` and `weekly_statement.csv`.
+
+---
+
+## 3. Database Schema Design
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Imported
-    Imported --> Disputed: OPEN event
-    Disputed --> Imported: CLOSE without refund
-    Disputed --> RefundAdjusted: CLOSE with supported refund
-    Imported --> Settled: eligible weekly settlement
-    RefundAdjusted --> Settled: eligible weekly settlement
-    Settled --> Corrected: correction request after source change
-    Corrected --> Corrected: later numbered correction
+erDiagram
+    restaurants ||--o{ orders : places
+    restaurants ||--o{ settlements : settles
+    settlements ||--o{ settlement_audit : audits
+    orders ||--o{ order_items : contains
+    orders ||--o{ disputes : disputes
+
+    restaurants {
+        string restaurant_id PK
+        string name
+        string plan
+        string onboarding_date
+        string rating
+        string packaging_charge
+        string weekly_ad_budget
+        string status
+        string cuisine
+        string opening_fy_gmv
+        string gstin
+    }
+    orders {
+        string order_id PK
+        string restaurant_id FK
+        string order_time
+        string items_gross
+        string restaurant_discount
+        string platform_discount
+        string cofund_discount
+        string packaging
+        string outcome
+        string refund_reason
+        string refund_amount
+        string dispute_status
+        int cancel_seconds
+        int accepted
+        string delivery_fee
+        string platform_fee
+    }
 ```
 
-Open disputes are excluded from settlement. On closure, the close timestamp determines the assigned payout week. A settled order remains attached to its original statement; a later dispute adjustment creates a correction revision rather than rewriting that statement.
+---
 
-## Database interactions and transaction boundaries
+## 4. Evaluation Output Format
 
-`connect()` enables foreign keys, executes the idempotent schema, and applies additive column migrations when needed. Restaurant and order imports commit complete files, dispute event files commit as a unit, settlement creation stores the statement/audit/order links together, and correction creation stores the revision and its per-order audit rows together. Unique keys protect order IDs, restaurant/week statements, dispute IDs, correction revisions and per-settlement audit orders. Source records, statement history and original audit snapshots are retained.
+### `order_breakup.csv` (23 columns)
+`order_id, restaurant_id, status, gross_item_value, restaurant_discount, platform_coupon, cofunded_restaurant_share, cofunded_platform_share, net_item_value, packaging_allowed, packaging_disallowed, commission_rate, commission, platform_fee, gst_on_commission, gst_9_5, tds_194o, coupon_reimbursement, refund_restaurant_share, refund_platform_share, penalty, restaurant_net, rule_ids`
 
-## Settlement workflow
+### `weekly_statement.csv` (12 columns)
+`restaurant_id, week_start, orders_settled, orders_excluded_dispute, gross_payable, ad_spend_deducted, debit_brought_forward, net_payout, debit_carried_forward, avg_rating, next_week_commission_uplift_pp, suspended_next_week`
 
-1. Validate that the requested week starts on Monday and load the restaurant.
-2. Select unassigned orders whose order date is in the requested week, or whose dispute close date is in that week; omit open disputes.
-3. Determine the prior-week rating adjustment and calculate each order breakup.
-4. Calculate TDS in financial-year order, aggregate statement totals, cap ads by budget and positive available payout, and retain unpaid ad debit.
-5. In one database transaction, insert the unique statement and per-order audit, assign the orders, update ad debit, then commit.
+---
 
-## Dispute and correction workflows
+## 5. Stretch Goals (Optional Extra Credit)
 
-An OPEN event creates a dispute record and marks the order open. A matching CLOSE event must not predate OPEN. Only an explicit positive amount with a supported funding reason adjusts the order refund ledger. If its refund funder conflicts with a prior refund reason, the event is rejected. After settlement, `correct-settlement` recomputes the statement from its source orders and appends a numbered revision with per-order audit snapshots. Later settlements are not automatically cascaded; this remains a pending policy/implementation limitation.
-
-## Money and reporting
-
-All money values are Decimal text in SQLite and quantized to two decimal places with ROUND_HALF_UP. TDS GMV is iterated in chronological order without converting to binary floating point. Commission uses gross less restaurant-funded discount; packaging is separate. A sub-Rs 100 order pays the fixed platform fee instead of commission. Section 9(5) GST is displayed as a deduction because the platform withholds and remits it for the restaurant. Delivery fees are totalled for visibility but excluded from payout pending a specified recipient/funding rule; see the README for assumptions.
-
-## Inputs
-
-Restaurant columns: `restaurant_id,name,plan,onboarding_date,rating,packaging_charge,weekly_ad_budget` (optional status). Order columns: `order_id,restaurant_id,order_time,items_gross` plus optional discounts, packaging, distance, mode, outcome, refund fields, dispute fields, cancel seconds, accepted flag, delivery fee, platform fee, rating. Itemized CSV repeats order fields on each line and uses `item_name,item_quantity,item_unit_price`; aggregate CSV remains compatible. JSON order objects may add `items:[{name,quantity,unit_price}]`. Dispute CSV events use `dispute_id,order_id,event,event_at,resolution,refund_amount,refund_reason`.
-
-## Known scope choices
-
-Rates and GST bases follow the supplied brief, with unresolved cancellation tax treatment documented separately. Platform fee below Rs 100 uses the specified flat minimum; other platform fees are accepted as already-calculated amounts. Delivery fees are recorded but not allocated without a defined recipient. Rating averages from the prior week set the following week's commission rate. For `SPILLED` refunds, the platform receives half rounded half-up to paise and the restaurant receives the remainder. See `decision_log.md` for exact interpretations and correction limits, and `br_traceability.md` for rule-to-test links.
+1. **Multi-Restaurant Order Split**: Partitioned line-item settlement supporting multiple restaurants on a single customer basket. Computes individual commissions, packaging allowances, and net payouts.
+2. **Dynamic Commission by Cuisine Demand**: Algorithmic surge pricing for take-rates based on cuisine category demand elasticities (e.g., Biryani peak demand multiplier).

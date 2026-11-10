@@ -9,6 +9,7 @@ def connect():
     db.executescript((ROOT / "database" / "schema.sql").read_text(encoding="utf-8"))
     # Keep existing project databases usable as the documented ledger gains columns.
     migrations = {
+        "restaurants": {"cuisine": "TEXT DEFAULT ''", "opening_fy_gmv": "TEXT DEFAULT '0.00'", "gstin": "TEXT DEFAULT ''"},
         "settlements": {"platform_discounts": "TEXT NOT NULL DEFAULT '0.00'", "delivery_fees": "TEXT NOT NULL DEFAULT '0.00'", "platform_fees": "TEXT NOT NULL DEFAULT '0.00'", "platform_refunds": "TEXT NOT NULL DEFAULT '0.00'"},
         "settlement_audit": {"platform_fee": "TEXT NOT NULL DEFAULT '0.00'", "delivery_fee": "TEXT NOT NULL DEFAULT '0.00'", "breakup_json": "TEXT NOT NULL DEFAULT '{}'"},
         "disputes": {"refund_amount": "TEXT NOT NULL DEFAULT '0.00'", "refund_reason": "TEXT NOT NULL DEFAULT ''"},

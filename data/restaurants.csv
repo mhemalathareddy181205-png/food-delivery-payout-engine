@@ -1,2 +1,11 @@
-restaurant_id,name,plan,onboarding_date,rating,packaging_charge,weekly_ad_budget,status
-R001,Sample Kitchen,STANDARD,2025-01-01,4.2,12.00,500.00,ACTIVE
+restaurant_id,restaurant_name,cuisine,commission_plan,onboarding_date,packaging_charge,weekly_ad_budget,opening_fy_gmv,gstin
+RST-01,Udupi Upahar,South Indian,PLUS,2024-04-01,30.00,5000.00,116500.00,29JDOCA7536I2ZM
+RST-02,Nawab Biryani Point,Biryani,STANDARD,2025-09-21,45.00,1000.00,105500.00,29RRJCJ7294A3ZN
+RST-03,Meghana Spice Biryani,Biryani,STANDARD,2026-08-07,25.00,2500.00,343500.00,29PDNCQ9768I2ZU
+RST-04,Dragon Wok,Chinese,PLUS,2025-01-19,30.00,500.00,85000.00,29WQVCD9672P1Z7
+RST-05,Chopsticks Express,Chinese,PLUS,2025-08-22,25.00,2500.00,495750.00,29RMVCJ8876N1ZI
+RST-06,Iyengar Bake House,Bakery,STANDARD,2023-01-05,0.00,1500.00,327500.00,29PLGCI7787Z2ZZ
+RST-07,Amritsari Rasoi,North Indian,PLUS,2023-05-11,25.00,0.00,284000.00,29WWZCQ4726X2Z4
+RST-08,Brahmin's Cafe,South Indian,PLUS,2024-08-12,0.00,500.00,270500.00,29EOACC0798C3ZC
+RST-09,Mylari Tiffins,South Indian,STANDARD,2023-10-02,30.00,1000.00,242500.00,29EAKCV9972R1ZU
+RST-10,Punjab Da Dhaba,North Indian,PLUS,2023-10-23,30.00,1000.00,103000.00,29NVFCE9486M1ZX
